@@ -86,7 +86,7 @@ https://greasyfork.org/zh-CN/scripts/440871-骚扰拦截
 
 通用编码问题检测和修复，适用于所有语言和内容类型，按 Cmd + Shift + E 打开编码选择菜单。
 
-https://github.com/ssfun/userscripts/blob/main/universal-encoding-fixer.user.js
+https://github.com/ssfun/userscripts/blob/main/encoding-fixer.user.js
 
 14、YAML Prettier
 
