@@ -88,3 +88,9 @@ https://greasyfork.org/zh-CN/scripts/440871-骚扰拦截
 
 https://github.com/ssfun/userscripts/blob/main/universal-encoding-fixer.user.js
 
+14、YAML Prettier
+
+将 YAML 数据漂亮地展示出来。
+
+https://github.com/ssfun/userscripts/blob/main/yaml-prettier.user.js
+
