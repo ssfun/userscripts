@@ -744,7 +744,7 @@
     });
 
     console.log('╔══════════════════════════════════════╗');
-    console.log('║   Safari 通用编码修复器 v3.0        ║');
+    console.log('║   Safari 通用编码修复器 v1.0        ║');
     console.log('╠══════════════════════════════════════╣');
     console.log('║  快捷键: Cmd/Ctrl + Shift + E       ║');
     console.log('║  右键: Alt + 右键                    ║');
