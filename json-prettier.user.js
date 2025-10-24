@@ -15,10 +15,10 @@
 // @grant       GM_setClipboard
 // @namespace   https://github.com/ssfun
 // @author      sfun
-// @homepage    https://github.com/ssfun
-// @homepageURL https://github.com/ssfun
-// @downloadURL https://github.com/ssfun
-// @updateURL   https://github.com/ssfun
+// @homepage    https://github.com/ssfun/userscripts
+// @homepageURL https://github.com/ssfun/userscripts
+// @downloadURL https://github.com/ssfun/userscripts/raw/refs/heads/main/json-prettier.user.js
+// @updateURL   https://github.com/ssfun/userscripts/raw/refs/heads/main/json-prettier.user.js
 // ==/UserScript==
 
 (function () {
