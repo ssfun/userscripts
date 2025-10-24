@@ -24,9 +24,9 @@ https://github.com/MerielVaren/remove-link-redirects
 
 https://greasyfork.org/zh-CN/scripts/483475-去除链接重定向
 
-5、YouTube HD Plus
+5、YouTube Theater Plus
 
-自动选择您偏好的视频画质，并在可用时启用高级播放。（支持YouTube桌面版、音乐版和移动版）
+为 YouTube 剧场模式增强功能，如全屏剧场、自动开启剧场等，并支持新界面
 
 https://github.com/fznhq/userscript-collection
 
