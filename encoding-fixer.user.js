@@ -1,6 +1,5 @@
 // ==UserScript==
-// @name        Universal Encoding Fixer
-// @icon        https://live.staticflickr.com/65535/52564733798_c1cb151c64_o.png
+// @name        Encoding Fixer
 // @version     1.0.1
 // @description Universal encoding problem detection and repair, suitable for all languages and content types, supports opening the encoding selection menu by pressing Cmd + Shift + E.
 // @description:zh-CN 通用编码问题检测和修复，适用于所有语言和内容类型，支持按 Cmd + Shift + E 打开编码选择菜单。
@@ -14,8 +13,8 @@
 // @author      sfun
 // @homepage    https://github.com/ssfun/userscripts
 // @homepageURL https://github.com/ssfun/userscripts
-// @downloadURL https://github.com/ssfun/userscripts/raw/refs/heads/main/universal-encoding-fixer.user.js
-// @updateURL   https://github.com/ssfun/userscripts/raw/refs/heads/main/universal-encoding-fixer.user.js
+// @downloadURL https://github.com/ssfun/userscripts/raw/refs/heads/main/encoding-fixer.user.js
+// @updateURL   https://github.com/ssfun/userscripts/raw/refs/heads/main/encoding-fixer.user.js
 // ==/UserScript==
 
 (function() {
