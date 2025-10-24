@@ -643,10 +643,10 @@
             const quality = analyzeTextQuality(sampleText);
             
             console.log('[编码检测] 页面质量分析:');
-            console.log(`  质量评分: ${quality.score.toFixed(1)}/100`);
-            console.log(`  是否乱码: ${quality.isGarbled ? '是' : '否'}`);
-            console.log(`  原因: ${quality.reason}`);
-            console.log(`  详细信息:`, quality.details);
+            console.log(`  [编码检测] 质量评分: ${quality.score.toFixed(1)}/100`);
+            console.log(`  [编码检测] 是否乱码: ${quality.isGarbled ? '是' : '否'}`);
+            console.log(`  [编码检测] 原因: ${quality.reason}`);
+            console.log(`  [编码检测] 详细信息:`, quality.details);
             
             const autoFix = GM_getValue('autoFix', false);
             const autoFixThreshold = GM_getValue('autoFixThreshold', 60);
@@ -742,14 +742,5 @@
             createEncodingMenu();
         }
     });
-
-    console.log('╔══════════════════════════════════════╗');
-    console.log('║   Safari 通用编码修复器 v1.0        ║');
-    console.log('╠══════════════════════════════════════╣');
-    console.log('║  快捷键: Cmd/Ctrl + Shift + E       ║');
-    console.log('║  右键: Alt + 右键                    ║');
-    console.log('║                                      ║');
-    console.log('║  通用智能检测，无硬编码依赖          ║');
-    console.log('╚══════════════════════════════════════╝');
 
 })();
