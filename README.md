@@ -40,4 +40,45 @@ https://github.com/fznhq/userscript-collection
 
 https://greasyfork.org/en/scripts/508784-youtube-hd-plus
 
+7、bilibili 页面净化大师
+
+净化 B站/哔哩哔哩 页面，支持「精简功能、播放器净化、过滤视频、过滤评论、全站黑白名单」
+
+https://github.com/festoney8/bilibili-cleaner
+
+https://greasyfork.org/zh-CN/scripts/479861-bilibili-页面净化大师
+
+8、V2EX_Good
+
+V2EX Good，增强使用体验
+
+https://greasyfork.org/zh-CN/scripts/3452
+
+9、自动展开全文阅读更多
+
+自动展开网站全文内容而无需点击，去掉一些烦人广告，去掉需要打开app的提示，站外链直达(支持鼠标左右键和拖拽打开)，避免网址重定向浪费时间，支持免登陆复制文字，兼容手机和电脑端
+
+https://greasyfork.org/zh-CN/users/306433
+
+10、CSDN优化
+
+支持PC和手机端、屏蔽广告、优化浏览体验、重定向拦截的Url、自动展开全文、自动展开代码块、全文居中、允许复制内容、去除复制内容的小尾巴、自定义屏蔽元素等
+
+https://github.com/WhiteSevs/TamperMonkeyScript
+
+https://greasyfork.org/zh-CN/scripts/406136-csdn优化
+
+11、搜索引擎去广告
+
+谷歌百度搜狗神马360必应头条抖音搜索去广告，适配电脑和手机，谷歌搜索拦截部分内容广场
+
+https://greasyfork.org/zh-CN/scripts/437351-搜索引擎去广告
+
+12、骚扰拦截
+
+手机、电脑全平台通用:自动拦截或删除`下载弹窗`、`悬浮按钮`等影响用户体验的元素
+
+https://github.com/AirBashX/UserScript
+
+https://greasyfork.org/zh-CN/scripts/440871-骚扰拦截
 
