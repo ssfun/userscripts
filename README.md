@@ -23,3 +23,21 @@ https://greasyfork.org/zh-CN/scripts/529980-youtube-cross-tab-picture-in-picture
 https://github.com/MerielVaren/remove-link-redirects
 
 https://greasyfork.org/zh-CN/scripts/483475-去除链接重定向
+
+5、YouTube HD Plus
+
+自动选择您偏好的视频画质，并在可用时启用高级播放。（支持YouTube桌面版、音乐版和移动版）
+
+https://github.com/fznhq/userscript-collection
+
+https://greasyfork.org/zh-CN/scripts/480701-youtube-theater-plus
+
+6、YouTube HD Plus
+
+自动选择您偏好的视频画质，并在可用时启用 Premium 播放。 (支持 YouTube 桌面版、音乐和移动端)
+
+https://github.com/fznhq/userscript-collection
+
+https://greasyfork.org/en/scripts/508784-youtube-hd-plus
+
+
