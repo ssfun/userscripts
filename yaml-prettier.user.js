@@ -4,6 +4,7 @@
 // @description Format YAML data in a beautiful way. 
 // @description:zh-CN 将 YAML 数据漂亮地展示出来。
 // @license     MIT
+// @match        *://*/*
 // @grant        GM_registerMenuCommand
 // @run-at       document-end
 // @namespace   https://github.com/ssfun
