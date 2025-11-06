@@ -20,9 +20,9 @@ https://greasyfork.org/zh-CN/scripts/529980-youtube-cross-tab-picture-in-picture
 
 去除网页内链接的重定向，具有高准确性和高稳定性，以及相比同类插件更低的时间占用。
 
-https://github.com/MerielVaren/remove-link-redirects
+https://github.com/LangYa466/remove-link-redirects-fix
 
-https://greasyfork.org/zh-CN/scripts/483475-去除链接重定向
+https://greasyfork.org/zh-CN/scripts/554872-去除链接重定向-修复版
 
 5、YouTube Theater Plus
 
