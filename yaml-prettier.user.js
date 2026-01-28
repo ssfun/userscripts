@@ -6,6 +6,7 @@
 // @license     MIT
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
+// @grant        GM_addStyle
 // @run-at       document-end
 // @namespace   https://github.com/ssfun
 // @author      sfun
@@ -45,10 +46,9 @@
   const injected = { format: false, toast: false, modal: false };
   function ensureStyle(kind) {
     if (injected[kind]) return;
-    const style = document.createElement('style');
-    style.setAttribute('data-yaml-style', kind);
+    let css = '';
     if (kind === 'format') {
-      style.textContent = `
+      css = `
         .yaml-formatted {
           font-family: 'SF Mono', Monaco, Menlo, Consolas, monospace !important;
           background: #f8f9fa !important;
@@ -74,7 +74,7 @@
         .yaml-url { color: #1971c2 !important; text-decoration: underline !important; }
       `;
     } else if (kind === 'toast') {
-      style.textContent = `
+      css = `
         .yaml-toast {
           position: fixed; top: 20px; right: 20px; z-index: 2147483647;
           background: rgba(102, 126, 234, 0.95); color: #fff;
@@ -86,7 +86,7 @@
         .yaml-toast.error { background: rgba(250, 82, 82, 0.95); }
       `;
     } else if (kind === 'modal') {
-      style.textContent = `
+      css = `
         .yaml-modal-overlay {
           position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 2147483646;
           display: flex; align-items: center; justify-content: center;
@@ -116,7 +116,7 @@
         .yaml-btn-reset { background: #dc3545; color: #fff; }
       `;
     }
-    document.head.appendChild(style);
+    if (css) GM_addStyle(css);
     injected[kind] = true;
   }
 

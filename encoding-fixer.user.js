@@ -8,6 +8,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_addStyle
 // @run-at       document-end
 // @namespace   https://github.com/ssfun
 // @author      sfun
@@ -19,6 +20,45 @@
 
 (function() {
     'use strict';
+
+    // ========== 注入所有样式 ==========
+    GM_addStyle(`
+        @keyframes slideInRight {
+            from { transform: translateX(450px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes scaleIn {
+            from {
+                transform: translate(-50%, -50%) scale(0.9);
+                opacity: 0;
+            }
+            to {
+                transform: translate(-50%, -50%) scale(1);
+                opacity: 1;
+            }
+        }
+        .encoding-btn {
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            background: white;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 14px;
+            font-weight: 500;
+            color: #333;
+        }
+        .encoding-btn:hover {
+            border-color: #2196F3;
+            background: #f0f7ff;
+            transform: translateY(-2px);
+            box-shadow: 0 2px 8px rgba(33,150,243,0.3);
+        }
+    `);
 
     // 支持的编码列表
     const ENCODINGS = [
@@ -399,19 +439,7 @@
         `;
         
         notification.textContent = message;
-        
-        if (!document.getElementById('encoding-fix-style')) {
-            const style = document.createElement('style');
-            style.id = 'encoding-fix-style';
-            style.textContent = `
-                @keyframes slideInRight {
-                    from { transform: translateX(450px); opacity: 0; }
-                    to { transform: translateX(0); opacity: 1; }
-                }
-            `;
-            document.head.appendChild(style);
-        }
-        
+
         document.body.appendChild(notification);
         
         if (autoClose > 0) {
@@ -460,46 +488,7 @@
             overflow-y: auto;
             animation: scaleIn 0.2s ease-out;
         `;
-        
-        if (!document.getElementById('menu-animation-style')) {
-            const style = document.createElement('style');
-            style.id = 'menu-animation-style';
-            style.textContent = `
-                @keyframes fadeIn {
-                    from { opacity: 0; }
-                    to { opacity: 1; }
-                }
-                @keyframes scaleIn {
-                    from { 
-                        transform: translate(-50%, -50%) scale(0.9);
-                        opacity: 0;
-                    }
-                    to { 
-                        transform: translate(-50%, -50%) scale(1);
-                        opacity: 1;
-                    }
-                }
-                .encoding-btn {
-                    padding: 12px;
-                    border: 2px solid #e0e0e0;
-                    border-radius: 8px;
-                    background: white;
-                    cursor: pointer;
-                    transition: all 0.2s;
-                    font-size: 14px;
-                    font-weight: 500;
-                    color: #333;
-                }
-                .encoding-btn:hover {
-                    border-color: #2196F3;
-                    background: #f0f7ff;
-                    transform: translateY(-2px);
-                    box-shadow: 0 2px 8px rgba(33,150,243,0.3);
-                }
-            `;
-            document.head.appendChild(style);
-        }
-        
+
         // 分析当前页面
         const currentText = (document.body?.innerText || '').substring(0, 2000);
         const currentQuality = analyzeTextQuality(currentText);
