@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        YAML Prettier
-// @version     1.1.0
+// @version     1.1.1
 // @description Format YAML data in a beautiful way with dark mode support.
 // @description:zh-CN 将 YAML 数据漂亮地展示出来，支持暗色模式。
 // @license     MIT
