@@ -5,6 +5,7 @@
 // @description:zh-CN 将 YAML 数据漂亮地展示出来，支持暗色模式。
 // @license     MIT
 // @match       *://*/*
+// @exclude     *.cloudflare.com
 // @grant       GM_addStyle
 // @grant       GM_setClipboard
 // @run-at      document-end
