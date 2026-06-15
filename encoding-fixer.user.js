@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name        Encoding Fixer
-// @version     1.0.1
+// @version     1.0.2
 // @description Universal encoding problem detection and repair, suitable for all languages and content types, supports opening the encoding selection menu by pressing Cmd + Shift + E.
 // @description:zh-CN 通用编码问题检测和修复，适用于所有语言和内容类型，支持按 Cmd + Shift + E 打开编码选择菜单。
 // @license     MIT
 // @match        *://*/*
+// @exclude     *.cloudflare.com
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
 // @grant        GM_getValue
