@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        JSON Prettier
 // @icon        https://live.staticflickr.com/65535/52564733798_c1cb151c64_o.png
-// @version     1.1.0
+// @version     1.1.1
 // @description Format JSON data in a beautiful way. Supporting indentation, copying, indentation toggling (2/4 spaces), width overflow optimization, dark mode, and copy path/value.
 // @description:zh-CN 将 JSON 数据漂亮地展示出来，支持缩进、复制、缩进切换（2/4 空格）、宽度溢出优化。
 // @license     MIT
