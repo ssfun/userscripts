@@ -2,10 +2,10 @@
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
 // @namespace    https://github.com/zhuxiongkai/github-home-enhancer
-// @version      2.2.0
+// @version      1.0.0
 // @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库的 Release 动态。
 // @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with a Release Radar for starred repositories.
-// @author       zhuxiongkai
+// @author       sfun
 // @license      MIT
 // @homepageURL  https://github.com/zhuxiongkai/github-home-enhancer
 // @supportURL   https://github.com/zhuxiongkai/github-home-enhancer/issues
@@ -13,8 +13,8 @@
 // @match        https://github.com/*
 // @run-at       document-idle
 // @grant        none
-// @downloadURL https://update.greasyfork.org/scripts/581668/GitHub%20%E9%A6%96%E9%A1%B5%E5%A2%9E%E5%BC%BA.user.js
-// @updateURL https://update.greasyfork.org/scripts/581668/GitHub%20%E9%A6%96%E9%A1%B5%E5%A2%9E%E5%BC%BA.meta.js
+// @downloadURL https://github.com/ssfun/userscripts/raw/refs/heads/main/gitHub-home-enhancer.user.js
+// @updateURL https://github.com/ssfun/userscripts/raw/refs/heads/main/gitHub-home-enhancer.user.js
 // ==/UserScript==
 
 (function () {
