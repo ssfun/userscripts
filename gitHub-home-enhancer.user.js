@@ -2,7 +2,7 @@
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
 // @namespace    https://github.com/zhuxiongkai/github-home-enhancer
-// @version      1.0.0
+// @version      1.1.0
 // @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库的 Release 动态。
 // @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with a Release Radar for starred repositories.
 // @author       sfun
@@ -724,7 +724,7 @@
       #${ROOT_ID} { min-height: calc(100vh - 64px); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, "Microsoft YaHei", sans-serif; color: #1f2328; background: #f6f8fa; }
       #${ROOT_ID} a { text-decoration: none; }
       .ghg-panel a:hover, .ghg-footer a:hover, .ghg-links a:hover, .ghg-repo:hover, .ghg-work-stats a:hover { color: #0969da; }
-      .ghg-shell { display: grid; grid-template-columns: 304px minmax(620px, 1fr) 328px; min-height: calc(100vh - 64px); border-top: 1px solid #d0d7de; }
+      .ghg-shell { display: grid; grid-template-columns: 304px minmax(0, 1fr) 328px; min-height: calc(100vh - 64px); border-top: 1px solid #d0d7de; }
 
       /* ── Left sidebar ──────────────────────────────────────────── */
       .ghg-left { position: sticky; top: 0; height: 100vh; overflow: auto; padding: 24px 16px 28px 24px; border-right: 1px solid #d0d7de; background: #ffffff; }
@@ -750,13 +750,13 @@
       .ghg-work-stats a:hover { background: #f6f8fa; color: #0969da; }
 
       /* ── Main column (Release Feed) ────────────────────────────── */
-      .ghg-main { padding: 24px 32px 48px; min-width: 0; background: #f6f8fa; }
+      .ghg-main { padding: 24px 32px 48px; min-width: 0; overflow: hidden; background: #f6f8fa; }
       .ghg-main-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
       .ghg-main h1 { margin: 0; color: #1f2328; font-size: 20px; line-height: 28px; font-weight: 600; }
-      .ghg-release-feed { display: grid; gap: 16px; }
+      .ghg-release-feed { display: grid; gap: 16px; min-width: 0; }
 
       /* ── Release card ──────────────────────────────────────────── */
-      .ghg-rc { background: #ffffff; border: 1px solid #d0d7de; border-radius: 8px; padding: 16px; }
+      .ghg-rc { background: #ffffff; border: 1px solid #d0d7de; border-radius: 8px; padding: 16px; overflow: hidden; }
 
       /* Card header: avatar + badge + meta */
       .ghg-rc-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
@@ -776,8 +776,8 @@
       .ghg-rc-tag:hover { color: #0969da; }
 
       /* Release notes body */
-      .ghg-rc-body { position: relative; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; }
-      .ghg-rc-body-inner { padding: 16px; max-height: ${BODY_MAX_HEIGHT}px; overflow: hidden; font-size: 14px; line-height: 1.6; color: #1f2328; }
+      .ghg-rc-body { position: relative; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; min-width: 0; }
+      .ghg-rc-body-inner { padding: 16px; max-height: ${BODY_MAX_HEIGHT}px; overflow: hidden; font-size: 14px; line-height: 1.6; color: #1f2328; overflow-wrap: break-word; word-break: break-word; }
       .ghg-rc-body-inner::after { content: ''; position: absolute; bottom: 32px; left: 0; right: 0; height: 60px; background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,1)); pointer-events: none; }
 
       /* Markdown-ish styling for release notes */
@@ -790,8 +790,8 @@
       .ghg-rc-body-inner ul, .ghg-rc-body-inner ol { margin: 8px 0; padding-left: 24px; }
       .ghg-rc-body-inner li { margin: 4px 0; }
       .ghg-rc-body-inner li + li { margin-top: 4px; }
-      .ghg-rc-body-inner code { padding: 2px 6px; border-radius: 4px; background: #eff1f3; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
-      .ghg-rc-body-inner pre { margin: 8px 0; padding: 12px; border-radius: 6px; background: #f6f8fa; overflow-x: auto; }
+      .ghg-rc-body-inner code { padding: 2px 6px; border-radius: 4px; background: #eff1f3; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+      .ghg-rc-body-inner pre { margin: 8px 0; padding: 12px; border-radius: 6px; background: #f6f8fa; overflow-x: auto; -webkit-overflow-scrolling: touch; }
       .ghg-rc-body-inner pre code { padding: 0; background: transparent; }
       .ghg-rc-body-inner a { color: #0969da; }
       .ghg-rc-body-inner a:hover { text-decoration: underline; }
@@ -845,7 +845,7 @@
 
       /* ── Responsive ────────────────────────────────────────────── */
       @media (max-width: 1180px) {
-        .ghg-shell { grid-template-columns: 280px minmax(420px, 1fr); }
+        .ghg-shell { grid-template-columns: 280px minmax(0, 1fr); }
         .ghg-right { display: none; }
       }
       @media (max-width: 820px) {
