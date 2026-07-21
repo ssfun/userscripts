@@ -2,7 +2,7 @@
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
 // @namespace    https://github.com/ssfun/userscripts
-// @version      1.1.5
+// @version      1.1.6
 // @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库的 Release 动态。
 // @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with a Release Radar for starred repositories.
 // @author       sfun
@@ -23,7 +23,7 @@
   // GitHub CSP is script-src github.githubassets.com only — page-context
   // injection is refused, and the whole userscript fails to run.
 
-  const SCRIPT_VERSION = '1.1.5';
+  const SCRIPT_VERSION = '1.1.6';
   const ROOT_ID = 'gh-home-enhancer-workbench';
   const ACTIVE_CLASS = 'gh-home-enhancer-active';
   const HOME_PATHS = new Set(['/', '', '/dashboard']);
@@ -40,12 +40,10 @@
   const DOM_CMD_ATTR = 'data-ghg-cmd';
   const DOM_STATE_ATTR = 'data-ghg-state';
   // Stars page is ordered by "recently starred", NOT release activity.
-  // Native dashboard already surfaces recent releases across ALL stars —
-  // we scrape those as priority seeds so old-but-active repos aren't missed.
   // How many starred-repo pages to scrape (≈30 repos/page).
-  // Bump this if a recently-released repo is missing from Release Radar —
-  // stars page is ordered by "when you starred", not by release activity.
   const STARS_MAX_PAGES = 15;                 // ~450 recently-starred repos
+  const RELEASE_FEED_LIMIT = 80;
+  const RELEASES_PER_REPO = 3;
 
   let lastData = null;
   let lastDataKey = '';
@@ -589,23 +587,51 @@
     return [];
   }
 
+  function parseTimestamp(value) {
+    if (value == null || value === '') return 0;
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    const raw = compact(value);
+    if (!raw) return 0;
+    const ms = Date.parse(raw);
+    if (Number.isFinite(ms)) return ms;
+    // Safari is pickier about some date forms; normalize "YYYY-MM-DD HH:mm:ss"
+    const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
+    const ms2 = Date.parse(normalized.endsWith('Z') || /[+-]\d{2}:?\d{2}$/.test(normalized)
+      ? normalized
+      : `${normalized}Z`);
+    return Number.isFinite(ms2) ? ms2 : 0;
+  }
+
   function mapAtomEntry(entry, repo) {
     const title = atomText(entry, 'title');
     const link = atomLinkHref(entry);
-    const updated = atomText(entry, 'updated') || atomText(entry, 'published');
+    // Prefer entry-level updated/published. Fall back to <id> date fragment if needed.
+    const updatedRaw = atomText(entry, 'updated') || atomText(entry, 'published');
+    const idText = atomText(entry, 'id');
     const authorNode = atomElement(entry, 'author');
     const author = (authorNode ? atomText(authorNode, 'name') : '') || repo.owner;
     const bodyRaw = atomContentHtml(entry);
 
     const tagMatch = link.match(/\/releases\/tag\/(.+)$/);
     const tagName = tagMatch ? decodeURIComponent(tagMatch[1]) : title;
-    if (!tagName && !updated) return null;
+    let createdAtMs = parseTimestamp(updatedRaw);
+    if (!createdAtMs && idText) {
+      // tag:github.com,2008:Repository/123/v1.0 is not a date; skip.
+      // Some feeds embed ISO timestamps in id — try a loose match.
+      const iso = idText.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/);
+      if (iso) createdAtMs = parseTimestamp(iso[0]);
+    }
+
+    if (!tagName && !createdAtMs) return null;
+
+    const createdAt = updatedRaw || (createdAtMs ? new Date(createdAtMs).toISOString() : '');
 
     return {
-      id: `release-${repo.name}-${tagName || updated}`,
+      id: `release-${repo.name}-${tagName || createdAtMs || title}`,
       actor: author,
       actorAvatar: githubAvatarUrl(repo.owner),
-      createdAt: updated,
+      createdAt,
+      createdAtMs,
       href: link || repo.href,
       tagName: tagName || title || 'release',
       releaseName: title,
@@ -618,19 +644,25 @@
   async function fetchRepoReleases(repo, { force = false } = {}) {
     const cacheKey = `releases-${repo.name}`;
     const cachedEntry = cacheRead(cacheKey);
+    const cachedItems = Array.isArray(cachedEntry?.data) ? cachedEntry.data : null;
 
-    if (!force && cachedEntry && !cachedEntry.expired) {
-      // Soft TTL: serve cache immediately, but let callers revalidate in background.
-      return {
-        items: Array.isArray(cachedEntry.data) ? cachedEntry.data : [],
-        fromCache: true,
-        softStale: cachedEntry.age > RELEASES_SOFT_TTL,
-        age: cachedEntry.age,
-      };
+    if (!force && cachedEntry && !cachedEntry.expired && cachedItems) {
+      // Empty arrays are NEVER treated as fresh — they are usually parse failures,
+      // rate-limit HTML, or a transient GitHub glitch. Always revalidate.
+      const empty = cachedItems.length === 0;
+      const softStale = empty || cachedEntry.age > RELEASES_SOFT_TTL;
+      if (!empty) {
+        return {
+          items: cachedItems,
+          fromCache: true,
+          softStale,
+          age: cachedEntry.age,
+        };
+      }
+      // fall through to network for empty cache even if hard TTL remains
     }
 
     if (!force && cachedEntry?.expired) {
-      // Drop hard-expired entries so we don't keep reusing them accidentally.
       cacheRemove(cacheKey);
     }
 
@@ -642,9 +674,8 @@
       });
     } catch (error) {
       console.warn(`${LOG_PREFIX} release fetch failed`, repo.name, error);
-      const stale = cacheGet(cacheKey, { allowExpired: true });
-      if (Array.isArray(stale)) {
-        return { items: stale, fromCache: true, softStale: true, error: true };
+      if (cachedItems?.length) {
+        return { items: cachedItems, fromCache: true, softStale: true, error: true };
       }
       return { items: [], fromCache: false, softStale: false, error: true };
     }
@@ -658,25 +689,51 @@
     if (!response.ok) {
       // 429 / 5xx / auth glitches: short retry window, keep stale data if any.
       console.warn(`${LOG_PREFIX} release HTTP ${response.status}`, repo.name);
-      cacheSet(cacheKey, cacheGet(cacheKey, { allowExpired: true }) || [], RELEASES_ERROR_TTL);
-      const stale = cacheGet(cacheKey, { allowExpired: true });
-      if (Array.isArray(stale) && stale.length) {
-        return { items: stale, fromCache: true, softStale: true, error: true };
+      if (cachedItems?.length) {
+        cacheSet(cacheKey, cachedItems, RELEASES_ERROR_TTL);
+        return { items: cachedItems, fromCache: true, softStale: true, error: true };
       }
+      cacheSet(cacheKey, [], RELEASES_ERROR_TTL);
       return { items: [], fromCache: false, softStale: false, error: true };
     }
 
     const xml = await response.text();
     if (!xml || !xml.includes('<')) {
-      cacheSet(cacheKey, [], RELEASES_ERROR_TTL);
-      return { items: [], fromCache: false, softStale: false, error: true };
+      cacheSet(cacheKey, cachedItems || [], RELEASES_ERROR_TTL);
+      return {
+        items: cachedItems || [],
+        fromCache: Boolean(cachedItems?.length),
+        softStale: true,
+        error: true,
+      };
     }
 
+    // Guard against GitHub HTML error pages being parsed as empty feeds.
+    const looksLikeAtom = /<feed[\s>]/i.test(xml) || /<entry[\s>]/i.test(xml);
     const { entries } = parseAtomDocument(xml);
     const releases = entries
-      .slice(0, 3)
+      .slice(0, RELEASES_PER_REPO)
       .map((entry) => mapAtomEntry(entry, repo))
-      .filter(Boolean);
+      .filter(Boolean)
+      // Ensure every card has a numeric timestamp for stable sorting.
+      .map((item) => ({
+        ...item,
+        createdAtMs: item.createdAtMs || parseTimestamp(item.createdAt),
+      }));
+
+    if (!releases.length) {
+      if (!looksLikeAtom) {
+        console.warn(`${LOG_PREFIX} non-atom body for`, repo.name, xml.slice(0, 120));
+        if (cachedItems?.length) {
+          return { items: cachedItems, fromCache: true, softStale: true, error: true };
+        }
+        cacheSet(cacheKey, [], RELEASES_ERROR_TTL);
+        return { items: [], fromCache: false, softStale: false, error: true };
+      }
+      // Genuine empty feed (repo has no releases).
+      cacheSet(cacheKey, [], RELEASES_CACHE_TTL);
+      return { items: [], fromCache: false, softStale: false };
+    }
 
     cacheSet(cacheKey, releases, RELEASES_CACHE_TTL);
     return { items: releases, fromCache: false, softStale: false };
@@ -705,12 +762,29 @@
     return results;
   }
 
+  function releaseSortKey(item) {
+    if (!item) return 0;
+    if (Number.isFinite(item.createdAtMs) && item.createdAtMs > 0) return item.createdAtMs;
+    return parseTimestamp(item.createdAt);
+  }
+
   function assembleReleaseItems(releaseLists) {
     return releaseLists
       .flat()
-      .filter((item) => item && item.createdAt)
-      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
-      .slice(0, 60);
+      .filter((item) => item && (item.createdAt || item.createdAtMs || item.tagName))
+      .map((item) => ({
+        ...item,
+        createdAtMs: releaseSortKey(item),
+        createdAt: item.createdAt || (item.createdAtMs ? new Date(item.createdAtMs).toISOString() : ''),
+      }))
+      // Newest first. Tie-break by repo/tag so the order is deterministic.
+      .sort((a, b) => {
+        const diff = (b.createdAtMs || 0) - (a.createdAtMs || 0);
+        if (diff !== 0) return diff;
+        return String(a.repoName || '').localeCompare(String(b.repoName || ''))
+          || String(b.tagName || '').localeCompare(String(a.tagName || ''));
+      })
+      .slice(0, RELEASE_FEED_LIMIT);
   }
 
   async function loadStarredReleases(data, { force = false, onPartial } = {}) {
@@ -721,15 +795,17 @@
       return { status: 'empty', items: [], revalidated: true };
     }
 
-    // Pass 1: prefer localStorage. Fresh cache paints immediately; missing/expired hit network.
+    // Pass 1: prefer localStorage. When force=true, skip cache and hit network.
     const firstPass = await fetchAllWithConcurrency(
       starredRepos,
-      (repo) => fetchRepoReleases(repo, { force: false }),
+      (repo) => fetchRepoReleases(repo, { force }),
       6
     );
 
     let networkHits = firstPass.filter((result) => result && !result.fromCache && !result.error).length;
-    const softStaleRepos = starredRepos.filter((_, index) => firstPass[index]?.softStale);
+    const softStaleRepos = force
+      ? []
+      : starredRepos.filter((_, index) => firstPass[index]?.softStale);
     let releaseLists = firstPass.map((result) => (result?.items ? result.items : []));
     let items = assembleReleaseItems(releaseLists);
 
@@ -742,10 +818,8 @@
       }
     }
 
-    // Pass 2: revalidate soft-stale caches, or everything when force=true.
-    const needsRefresh = force
-      ? starredRepos
-      : softStaleRepos;
+    // Pass 2: revalidate soft-stale caches only (force already did a full network pass).
+    const needsRefresh = softStaleRepos;
 
     if (needsRefresh.length) {
       const refreshed = await fetchAllWithConcurrency(
@@ -769,13 +843,21 @@
       items = assembleReleaseItems(releaseLists);
     }
 
-    console.debug(`${LOG_PREFIX} releases loaded`, {
+    const top = items.slice(0, 8).map((item) => ({
+      repo: item.repoName,
+      tag: item.tagName,
+      at: item.createdAt,
+      ms: item.createdAtMs,
+    }));
+
+    console.info(`${LOG_PREFIX} releases loaded`, {
       repos: starredRepos.length,
       items: items.length,
       networkHits,
       softStale: softStaleRepos.length,
       refreshed: needsRefresh.length,
       force,
+      top,
     });
 
     return {
@@ -1327,7 +1409,12 @@
       releaseCount: lastData?.releaseItems?.length || 0,
       releaseFetchedAt: lastData?.releaseFetchedAt || 0,
       userName: lastData?.userName || null,
-      topTags: (lastData?.releaseItems || []).slice(0, 5).map((item) => `${item.repoName}@${item.tagName}`),
+      topTags: (lastData?.releaseItems || []).slice(0, 8).map((item) => ({
+        repo: item.repoName,
+        tag: item.tagName,
+        at: item.createdAt,
+        ms: item.createdAtMs || 0,
+      })),
     };
     try {
       document.documentElement.setAttribute(DOM_STATE_ATTR, JSON.stringify(state));
@@ -1442,4 +1529,3 @@
   window.addEventListener('turbo:render', scheduleBoot);
   window.addEventListener('pjax:end', scheduleBoot);
 })();
-
