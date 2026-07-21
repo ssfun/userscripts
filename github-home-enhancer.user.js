@@ -2,7 +2,7 @@
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
 // @namespace    https://github.com/ssfun/userscripts
-// @version      1.1.2
+// @version      1.1.3
 // @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库的 Release 动态。
 // @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with a Release Radar for starred repositories.
 // @author       sfun
@@ -12,6 +12,7 @@
 // @match        https://github.com/*
 // @run-at       document-idle
 // @grant        none
+// @inject-into  page
 // @downloadURL https://github.com/ssfun/userscripts/raw/refs/heads/main/github-home-enhancer.user.js
 // @updateURL https://github.com/ssfun/userscripts/raw/refs/heads/main/github-home-enhancer.user.js
 // ==/UserScript==
@@ -19,6 +20,7 @@
 (function () {
   'use strict';
 
+  const SCRIPT_VERSION = '1.1.3';
   const ROOT_ID = 'gh-home-enhancer-workbench';
   const ACTIVE_CLASS = 'gh-home-enhancer-active';
   const HOME_PATHS = new Set(['/', '', '/dashboard']);
@@ -36,6 +38,18 @@
   let lastDataKey = '';
   let releaseLoadKey = '';
   let releaseRequestId = 0;
+
+  // Immediate boot marker so Safari console can verify the NEW file is injected.
+  // If you do not see this log, the userscript manager is still running an old copy.
+  try {
+    document.documentElement.setAttribute('data-ghg-home-enhancer', SCRIPT_VERSION);
+    console.info(`${LOG_PREFIX} v${SCRIPT_VERSION} injected`, {
+      href: location.href,
+      grant: 'none',
+    });
+  } catch (error) {
+    // ignore
+  }
 
   const LABELS = {
     en: {
@@ -70,6 +84,8 @@
       hoursAgo: 'hours ago',
       daysAgo: 'days ago',
       monthsAgo: 'months ago',
+      refresh: 'Refresh',
+      refreshing: 'Refreshing…',
     },
     zh: {
       myWorkspace: '我的工作台',
@@ -103,6 +119,8 @@
       hoursAgo: '小时前',
       daysAgo: '天前',
       monthsAgo: '个月前',
+      refresh: '刷新',
+      refreshing: '刷新中…',
     },
   };
 
@@ -904,14 +922,35 @@
 
   // ── Render ────────────────────────────────────────────────────────────
 
+  function bindWorkbenchEvents(root) {
+    const refreshBtn = root.querySelector('[data-ghg-refresh]');
+    if (!refreshBtn || refreshBtn.dataset.bound === '1') return;
+    refreshBtn.dataset.bound = '1';
+    refreshBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      refreshBtn.disabled = true;
+      refreshBtn.textContent = t('refreshing');
+      hardRefreshReleases().finally(() => {
+        // renderWorkbench will rebuild the button; keep a fallback if still mounted.
+        if (refreshBtn.isConnected) {
+          refreshBtn.disabled = false;
+          refreshBtn.textContent = t('refresh');
+        }
+      });
+    });
+  }
+
   function renderWorkbench(data) {
     let root = document.getElementById(ROOT_ID);
     if (!root) {
       root = document.createElement('div');
       root.id = ROOT_ID;
+      root.dataset.ghgVersion = SCRIPT_VERSION;
       findInsertionPoint().before(root);
     }
 
+    const isRefreshing = data.releaseStatus === 'loading' && Boolean(data.releaseItems?.length);
+    root.dataset.ghgVersion = SCRIPT_VERSION;
     root.innerHTML = `
       <style>${styles()}</style>
       <div class="ghg-shell">
@@ -922,6 +961,12 @@
         <main class="ghg-main" aria-label="${escapeHtml(t('releaseRadar'))}">
           <div class="ghg-main-head">
             <h1>${escapeHtml(t('releaseRadar'))}</h1>
+            <div class="ghg-main-actions">
+              <span class="ghg-version" title="GitHub Home Enhancer">v${escapeHtml(SCRIPT_VERSION)}</span>
+              <button type="button" class="ghg-refresh-btn" data-ghg-refresh ${isRefreshing ? 'disabled' : ''}>
+                ${escapeHtml(isRefreshing ? t('refreshing') : t('refresh'))}
+              </button>
+            </div>
           </div>
           <div class="ghg-release-feed">
             ${releaseFeedTemplate(data)}
@@ -977,8 +1022,14 @@
       </div>
     `;
 
+    bindWorkbenchEvents(root);
     document.body.classList.add(ACTIVE_CLASS);
-    console.debug(`${LOG_PREFIX} rendered`, { path: location.pathname, releases: (data.releaseItems || []).length });
+    console.debug(`${LOG_PREFIX} rendered`, {
+      version: SCRIPT_VERSION,
+      path: location.pathname,
+      releases: (data.releaseItems || []).length,
+      status: data.releaseStatus,
+    });
   }
 
   // ── Styles ────────────────────────────────────────────────────────────
@@ -1021,8 +1072,13 @@
 
       /* ── Main column (Release Feed) ────────────────────────────── */
       .ghg-main { padding: 24px 32px 48px; min-width: 0; overflow: hidden; background: #f6f8fa; }
-      .ghg-main-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+      .ghg-main-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
       .ghg-main h1 { margin: 0; color: #1f2328; font-size: 20px; line-height: 28px; font-weight: 600; }
+      .ghg-main-actions { display: inline-flex; align-items: center; gap: 10px; flex-shrink: 0; }
+      .ghg-version { color: #8c959f; font-size: 12px; font-variant-numeric: tabular-nums; }
+      .ghg-refresh-btn { appearance: none; border: 1px solid #d0d7de; background: #ffffff; color: #24292f; border-radius: 6px; padding: 5px 12px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; line-height: 20px; }
+      .ghg-refresh-btn:hover:not(:disabled) { background: #f6f8fa; border-color: #afb8c1; }
+      .ghg-refresh-btn:disabled { opacity: 0.65; cursor: default; }
       .ghg-release-feed { display: grid; gap: 16px; min-width: 0; }
 
       /* ── Release card ──────────────────────────────────────────── */
@@ -1180,19 +1236,101 @@
     }
   }
 
-  // Manual escape hatch for debugging in Safari Web Inspector:
-  //   window.__ghgRefreshReleases()
-  window.__ghgRefreshReleases = function ghgRefreshReleases() {
-    Object.keys(localStorage)
-      .filter((key) => key.startsWith(CACHE_PREFIX))
-      .forEach((key) => localStorage.removeItem(key));
-    lastData = null;
-    lastDataKey = '';
+  function clearReleaseCaches() {
+    const removed = [];
+    try {
+      Object.keys(localStorage)
+        .filter((key) => key.startsWith(CACHE_PREFIX))
+        .forEach((key) => {
+          localStorage.removeItem(key);
+          removed.push(key);
+        });
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} failed to clear localStorage cache`, error);
+    }
+    return removed;
+  }
+
+  async function hardRefreshReleases() {
+    const removed = clearReleaseCaches();
     releaseLoadKey = '';
     releaseRequestId += 1;
-    scheduleBoot();
-    console.info(`${LOG_PREFIX} cache cleared; reloading release radar`);
-  };
+
+    if (!isGithubHome() || !isLoggedInHome()) {
+      lastData = null;
+      lastDataKey = '';
+      scheduleBoot();
+      console.info(`${LOG_PREFIX} cache cleared (${removed.length}); waiting for home page`, {
+        version: SCRIPT_VERSION,
+      });
+      return { removed: removed.length, status: 'deferred' };
+    }
+
+    if (!lastData) {
+      scheduleBoot();
+      console.info(`${LOG_PREFIX} cache cleared (${removed.length}); rebooting`, {
+        version: SCRIPT_VERSION,
+      });
+      return { removed: removed.length, status: 'reboot' };
+    }
+
+    lastData.releaseStatus = 'loading';
+    // Keep existing cards visible while we refetch.
+    lastData.releaseFetchedAt = 0;
+    renderWorkbench(lastData);
+
+    const key = lastDataKey || dataKey(lastData);
+    loadReleasesFor(lastData, key, { force: true });
+    console.info(`${LOG_PREFIX} hard refresh started`, {
+      version: SCRIPT_VERSION,
+      removed: removed.length,
+      user: lastData.userName,
+    });
+    return { removed: removed.length, status: 'loading' };
+  }
+
+  function exposeApi() {
+    const api = {
+      version: SCRIPT_VERSION,
+      refresh: hardRefreshReleases,
+      clearCache: clearReleaseCaches,
+      getState: () => ({
+        version: SCRIPT_VERSION,
+        lastDataKey,
+        releaseLoadKey,
+        releaseStatus: lastData?.releaseStatus || null,
+        releaseCount: lastData?.releaseItems?.length || 0,
+        releaseFetchedAt: lastData?.releaseFetchedAt || 0,
+        userName: lastData?.userName || null,
+      }),
+    };
+
+    // Prefer page window. Fall back to unsafeWindow for managers that sandbox
+    // even with @grant none (common on Safari Userscripts / some TM builds).
+    const targets = [];
+    try { targets.push(window); } catch (error) { /* ignore */ }
+    try {
+      if (typeof unsafeWindow !== 'undefined' && unsafeWindow) targets.push(unsafeWindow);
+    } catch (error) {
+      // ignore
+    }
+
+    for (const target of targets) {
+      try {
+        target.__ghgHomeEnhancer = api;
+        target.__ghgRefreshReleases = hardRefreshReleases;
+        target.__GHG_HOME_ENHANCER_VERSION__ = SCRIPT_VERSION;
+      } catch (error) {
+        // ignore read-only window bindings
+      }
+    }
+
+    try {
+      document.documentElement.setAttribute('data-ghg-home-enhancer', SCRIPT_VERSION);
+    } catch (error) {
+      // ignore
+    }
+  }
 
   let scheduled = false;
   function scheduleBoot() {
@@ -1204,6 +1342,7 @@
     }, 0);
   }
 
+  exposeApi();
   scheduleBoot();
   [300, 1000, 2500, 5000].forEach((delay) => {
     window.setTimeout(scheduleBoot, delay);
