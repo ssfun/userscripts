@@ -2,7 +2,7 @@
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
 // @namespace    https://github.com/ssfun/userscripts
-// @version      1.1.6
+// @version      1.1.7
 // @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库的 Release 动态。
 // @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with a Release Radar for starred repositories.
 // @author       sfun
@@ -23,7 +23,7 @@
   // GitHub CSP is script-src github.githubassets.com only — page-context
   // injection is refused, and the whole userscript fails to run.
 
-  const SCRIPT_VERSION = '1.1.6';
+  const SCRIPT_VERSION = '1.1.7';
   const ROOT_ID = 'gh-home-enhancer-workbench';
   const ACTIVE_CLASS = 'gh-home-enhancer-active';
   const HOME_PATHS = new Set(['/', '', '/dashboard']);
@@ -44,6 +44,11 @@
   const STARS_MAX_PAGES = 15;                 // ~450 recently-starred repos
   const RELEASE_FEED_LIMIT = 80;
   const RELEASES_PER_REPO = 3;
+  const FEED_SEED_LIMIT = 50;
+
+  // Snapshot of native dashboard release activity, captured before we hide the feed.
+  let feedReleaseSeeds = [];
+  let feedReleaseHints = [];
 
   let lastData = null;
   let lastDataKey = '';
@@ -505,6 +510,166 @@
     }).replace(/\//g, '-');
   }
 
+  // ── Native dashboard feed seeds ───────────────────────────────────────
+  // GitHub's home feed already knows the newest releases across stars /
+  // follows. Stars page order is "when you starred", so a repo starred
+  // months ago but releasing today can still be missing from a pure stars
+  // scrape if selectors/pagination fail. We harvest release cards from the
+  // native feed (before we hide it) as high-priority repos + fallback cards.
+
+  function isValidRepoSlug(owner, repo) {
+    return Boolean(
+      owner
+      && repo
+      && /^[A-Za-z0-9_.-]+$/.test(owner)
+      && /^[A-Za-z0-9_.-]+$/.test(repo)
+      && !['settings', 'marketplace', 'explore', 'topics', 'orgs', 'users', 'login', 'signup'].includes(owner)
+    );
+  }
+
+  function repoFromPath(pathname) {
+    const parts = String(pathname || '').split('/').filter(Boolean);
+    if (parts.length < 2) return null;
+    const [owner, repo] = parts;
+    if (!isValidRepoSlug(owner, repo)) return null;
+    return {
+      name: `${owner}/${repo}`,
+      owner,
+      repo,
+      href: `https://github.com/${owner}/${repo}`,
+    };
+  }
+
+  function scrapeNativeFeedReleases(root = document) {
+    const seeds = [];
+    const hints = [];
+    const seenSeed = new Set();
+    const seenHint = new Set();
+
+    const pushSeed = (repoLike, source = 'feed') => {
+      if (!repoLike?.name || seenSeed.has(repoLike.name)) return;
+      seenSeed.add(repoLike.name);
+      seeds.push({ ...repoLike, source });
+    };
+
+    const pushHint = (item) => {
+      if (!item?.repoName || !item?.tagName) return;
+      const key = `${item.repoName}@${item.tagName}`;
+      if (seenHint.has(key)) return;
+      seenHint.add(key);
+      hints.push(item);
+    };
+
+    // 1) Direct release/tag links anywhere in the visible feed.
+    const releaseLinks = Array.from(root.querySelectorAll('a[href*="/releases/tag/"], a[href*="/releases/"]'));
+    for (const link of releaseLinks) {
+      let url;
+      try {
+        url = new URL(link.getAttribute('href') || link.href, location.origin);
+      } catch (error) {
+        continue;
+      }
+      if (url.hostname !== 'github.com') continue;
+      const parts = url.pathname.split('/').filter(Boolean);
+      // owner/repo/releases/tag/v1.2.3
+      if (parts.length < 4 || parts[2] !== 'releases') continue;
+      const repo = repoFromPath(`/${parts[0]}/${parts[1]}`);
+      if (!repo) continue;
+      pushSeed(repo, 'feed-link');
+
+      if (parts[3] === 'tag' && parts[4]) {
+        const tagName = decodeURIComponent(parts.slice(4).join('/'));
+        const card = link.closest('article, .body, .feed-item, [data-repository-hovercards-enabled], .TimelineItem, li, div');
+        const timeEl = card?.querySelector('relative-time, time');
+        const createdAt = timeEl?.getAttribute('datetime') || timeEl?.dateTime || timeEl?.getAttribute('title') || '';
+        const createdAtMs = parseTimestamp(createdAt);
+        pushHint({
+          id: `feed-${repo.name}-${tagName}`,
+          actor: repo.owner,
+          actorAvatar: githubAvatarUrl(repo.owner),
+          createdAt: createdAt || (createdAtMs ? new Date(createdAtMs).toISOString() : new Date().toISOString()),
+          createdAtMs: createdAtMs || Date.now(),
+          href: url.href,
+          tagName,
+          releaseName: tagName,
+          repoName: repo.name,
+          repoOwner: repo.owner,
+          bodyHtml: '',
+          source: 'native-feed',
+        });
+      }
+    }
+
+    // 2) Text cues: "released", "published a release", Chinese "发布了".
+    const textNodes = Array.from(root.querySelectorAll('article, .body, .feed-item, [class*="feed"], [class*="Feed"]'));
+    for (const node of textNodes) {
+      const text = compact(node.textContent || '');
+      if (!/(released|published a release|创建了|发布了)/i.test(text)) continue;
+      const repoLink = node.querySelector('a[data-hovercard-type="repository"], a[href^="/"][data-hydro-click], a[href*="/"]');
+      if (!repoLink) continue;
+      try {
+        const url = new URL(repoLink.getAttribute('href') || repoLink.href, location.origin);
+        const repo = repoFromPath(url.pathname);
+        if (repo) pushSeed(repo, 'feed-text');
+      } catch (error) {
+        // ignore
+      }
+    }
+
+    // 3) Hovercard-marked repository anchors near release verbs.
+    const repoAnchors = Array.from(root.querySelectorAll('a[data-hovercard-type="repository"]'));
+    for (const anchor of repoAnchors) {
+      const parentText = compact(anchor.closest('article, .body, .feed-item, div, li')?.textContent || '');
+      if (!/(released|release|发布)/i.test(parentText)) continue;
+      try {
+        const url = new URL(anchor.getAttribute('href') || anchor.href, location.origin);
+        const repo = repoFromPath(url.pathname);
+        if (repo) pushSeed(repo, 'feed-hovercard');
+      } catch (error) {
+        // ignore
+      }
+    }
+
+    return {
+      seeds: seeds.slice(0, FEED_SEED_LIMIT),
+      hints: hints
+        .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
+        .slice(0, FEED_SEED_LIMIT),
+    };
+  }
+
+  function captureNativeFeedSnapshot() {
+    // Prefer the live feed container. Fall back to whole document.
+    const root = document.querySelector('.feed-background, [data-target="feed-container"], main, body') || document;
+    const { seeds, hints } = scrapeNativeFeedReleases(root);
+    if (seeds.length) feedReleaseSeeds = seeds;
+    if (hints.length) feedReleaseHints = hints;
+    console.debug(`${LOG_PREFIX} native feed seeds`, {
+      seeds: feedReleaseSeeds.map((repo) => repo.name),
+      hints: feedReleaseHints.map((item) => `${item.repoName}@${item.tagName}`),
+    });
+    return { seeds: feedReleaseSeeds, hints: feedReleaseHints };
+  }
+
+  function mergeRepoLists(...lists) {
+    const seen = new Set();
+    const merged = [];
+    for (const list of lists) {
+      for (const repo of list || []) {
+        if (!repo?.name || seen.has(repo.name)) continue;
+        seen.add(repo.name);
+        merged.push({
+          name: repo.name,
+          owner: repo.owner,
+          repo: repo.repo,
+          href: repo.href || `https://github.com/${repo.name}`,
+          source: repo.source || 'stars',
+        });
+      }
+    }
+    return merged;
+  }
+
   // ── Starred repos & releases fetching ─────────────────────────────────
 
   async function fetchStarredRepos(userName, { force = false } = {}) {
@@ -788,28 +953,50 @@
   }
 
   async function loadStarredReleases(data, { force = false, onPartial } = {}) {
+    // Re-capture feed seeds if we still can (feed not yet removed / turbo revisit).
+    if (!feedReleaseSeeds.length || force) {
+      try { captureNativeFeedSnapshot(); } catch (error) { /* ignore */ }
+    }
+
     // force also re-scrapes the stars list — otherwise STARS_MAX_PAGES changes
     // and newly-starred / older-starred repos stay invisible for up to 6h.
     const starredRepos = await fetchStarredRepos(data.userName, { force });
-    if (!starredRepos.length) {
-      return { status: 'empty', items: [], revalidated: true };
+
+    // Priority: native-feed release repos first, then starred list.
+    // This is what makes cards like YonQua/warp-socks appear even when the
+    // stars scrape misses them or orders them poorly.
+    const candidateRepos = mergeRepoLists(feedReleaseSeeds, starredRepos, data.repos || []);
+    if (!candidateRepos.length) {
+      // Still surface feed hints alone if we have them.
+      const hintOnly = assembleReleaseItems([feedReleaseHints]);
+      return {
+        status: hintOnly.length ? 'ready' : 'empty',
+        items: hintOnly,
+        revalidated: true,
+      };
     }
 
     // Pass 1: prefer localStorage. When force=true, skip cache and hit network.
+    // Feed-seeded repos always revalidate first (they're the "new right now" set).
+    const seedNames = new Set(feedReleaseSeeds.map((repo) => repo.name));
     const firstPass = await fetchAllWithConcurrency(
-      starredRepos,
-      (repo) => fetchRepoReleases(repo, { force }),
+      candidateRepos,
+      (repo) => fetchRepoReleases(repo, {
+        force: force || seedNames.has(repo.name),
+      }),
       6
     );
 
     let networkHits = firstPass.filter((result) => result && !result.fromCache && !result.error).length;
     const softStaleRepos = force
       ? []
-      : starredRepos.filter((_, index) => firstPass[index]?.softStale);
+      : candidateRepos.filter((_, index) => firstPass[index]?.softStale && !seedNames.has(candidateRepos[index].name));
     let releaseLists = firstPass.map((result) => (result?.items ? result.items : []));
+    // Merge native-feed hint cards so a release is visible even before atom returns.
+    releaseLists = releaseLists.concat([feedReleaseHints]);
     let items = assembleReleaseItems(releaseLists);
 
-    // Paint cached cards ASAP, then revalidate soft-stale repos in the background path.
+    // Paint cached/hint cards ASAP, then revalidate soft-stale repos.
     if (typeof onPartial === 'function' && items.length) {
       try {
         onPartial({ status: 'ready', items, partial: true });
@@ -818,7 +1005,7 @@
       }
     }
 
-    // Pass 2: revalidate soft-stale caches only (force already did a full network pass).
+    // Pass 2: revalidate soft-stale caches only (force/seeds already networked).
     const needsRefresh = softStaleRepos;
 
     if (needsRefresh.length) {
@@ -828,7 +1015,7 @@
         4
       );
       const refreshMap = new Map(needsRefresh.map((repo, i) => [repo.name, refreshed[i]]));
-      releaseLists = starredRepos.map((repo, index) => {
+      releaseLists = candidateRepos.map((repo, index) => {
         const updated = refreshMap.get(repo.name);
         if (updated) {
           if (!updated.error && !updated.fromCache) networkHits += 1;
@@ -840,23 +1027,42 @@
         }
         return firstPass[index]?.items || [];
       });
+      releaseLists = releaseLists.concat([feedReleaseHints]);
       items = assembleReleaseItems(releaseLists);
     }
+
+    // Dedupe by repo@tag after merge (atom + feed hint may both contribute).
+    const deduped = [];
+    const seenCard = new Set();
+    for (const item of items) {
+      const key = `${item.repoName}@${item.tagName}`;
+      if (seenCard.has(key)) continue;
+      seenCard.add(key);
+      deduped.push(item);
+    }
+    items = deduped.slice(0, RELEASE_FEED_LIMIT);
 
     const top = items.slice(0, 8).map((item) => ({
       repo: item.repoName,
       tag: item.tagName,
       at: item.createdAt,
       ms: item.createdAtMs,
+      source: item.source || 'atom',
     }));
 
+    const hasWarpSocks = candidateRepos.some((repo) => /warp-socks/i.test(repo.name));
     console.info(`${LOG_PREFIX} releases loaded`, {
-      repos: starredRepos.length,
+      repos: candidateRepos.length,
+      starred: starredRepos.length,
+      feedSeeds: feedReleaseSeeds.length,
+      feedHints: feedReleaseHints.length,
       items: items.length,
       networkHits,
       softStale: softStaleRepos.length,
       refreshed: needsRefresh.length,
       force,
+      hasWarpSocks,
+      seedSample: feedReleaseSeeds.slice(0, 8).map((repo) => repo.name),
       top,
     });
 
@@ -1311,6 +1517,12 @@
       return;
     }
 
+    // Capture native feed release activity BEFORE we hide the dashboard feed.
+    // Must run prior to renderWorkbench() which applies ACTIVE_CLASS CSS.
+    // Delayed boots (300–5000ms) re-run this once Turbo finishes painting the feed.
+    let seedSnapshot = { seeds: feedReleaseSeeds, hints: feedReleaseHints };
+    try { seedSnapshot = captureNativeFeedSnapshot(); } catch (error) { /* ignore */ }
+
     const data = collectGithubData();
     const key = dataKey(data);
     if (lastData && lastDataKey === key && document.getElementById(ROOT_ID)) {
@@ -1322,6 +1534,15 @@
       // instead of permanently freezing the first successful paint in memory.
       const age = Date.now() - (lastData.releaseFetchedAt || 0);
       if (age >= MEMORY_REFRESH_MS) {
+        loadReleasesFor(lastData, key, { force: false });
+        return;
+      }
+      // If the native feed painted later and revealed new release repos we
+      // haven't loaded yet, force a revalidation so they appear immediately.
+      const knownRepos = new Set((lastData.releaseItems || []).map((item) => item.repoName));
+      const newSeeds = (seedSnapshot.seeds || []).filter((repo) => !knownRepos.has(repo.name));
+      if (newSeeds.length) {
+        console.info(`${LOG_PREFIX} new feed seeds after paint`, newSeeds.map((repo) => repo.name));
         loadReleasesFor(lastData, key, { force: false });
       }
       return;
@@ -1409,11 +1630,16 @@
       releaseCount: lastData?.releaseItems?.length || 0,
       releaseFetchedAt: lastData?.releaseFetchedAt || 0,
       userName: lastData?.userName || null,
+      feedSeedCount: feedReleaseSeeds.length,
+      feedHintCount: feedReleaseHints.length,
+      feedSeeds: feedReleaseSeeds.slice(0, 12).map((repo) => repo.name),
+      feedHints: feedReleaseHints.slice(0, 8).map((item) => `${item.repoName}@${item.tagName}`),
       topTags: (lastData?.releaseItems || []).slice(0, 8).map((item) => ({
         repo: item.repoName,
         tag: item.tagName,
         at: item.createdAt,
         ms: item.createdAtMs || 0,
+        source: item.source || 'atom',
       })),
     };
     try {
@@ -1425,16 +1651,37 @@
   }
 
   function handleExternalCommand(raw) {
-    const cmd = String(raw || '').trim().toLowerCase();
-    if (!cmd) return;
+    const value = String(raw || '').trim();
+    if (!value) return;
+    const [cmdRaw, argRaw = ''] = value.split(':');
+    const cmd = cmdRaw.toLowerCase();
+    const arg = argRaw.trim();
+
     if (cmd === 'refresh' || cmd === 'hard-refresh' || cmd === 'reload') {
       hardRefreshReleases();
     } else if (cmd === 'clear' || cmd === 'clear-cache') {
       clearReleaseCaches();
       publishState();
     } else if (cmd === 'state' || cmd === 'ping') {
-      publishState();
       console.info(`${LOG_PREFIX} state`, publishState());
+    } else if (cmd === 'scan-feed') {
+      const snap = captureNativeFeedSnapshot();
+      console.info(`${LOG_PREFIX} scan-feed`, snap);
+      publishState();
+    } else if (cmd === 'has' || cmd === 'find') {
+      const needle = arg.toLowerCase();
+      const state = publishState();
+      const inTop = (state.topTags || []).filter((item) =>
+        `${item.repo}@${item.tag}`.toLowerCase().includes(needle)
+      );
+      const inSeeds = feedReleaseSeeds.filter((repo) => repo.name.toLowerCase().includes(needle));
+      const inHints = feedReleaseHints.filter((item) =>
+        `${item.repoName}@${item.tagName}`.toLowerCase().includes(needle)
+      );
+      const inItems = (lastData?.releaseItems || []).filter((item) =>
+        `${item.repoName}@${item.tagName}`.toLowerCase().includes(needle)
+      );
+      console.info(`${LOG_PREFIX} find "${arg}"`, { inTop, inSeeds, inHints, inItems });
     }
   }
 
