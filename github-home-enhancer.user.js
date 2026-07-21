@@ -2,7 +2,7 @@
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
 // @namespace    https://github.com/ssfun/userscripts
-// @version      1.1.3
+// @version      1.1.4
 // @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库的 Release 动态。
 // @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with a Release Radar for starred repositories.
 // @author       sfun
@@ -12,7 +12,6 @@
 // @match        https://github.com/*
 // @run-at       document-idle
 // @grant        none
-// @inject-into  page
 // @downloadURL https://github.com/ssfun/userscripts/raw/refs/heads/main/github-home-enhancer.user.js
 // @updateURL https://github.com/ssfun/userscripts/raw/refs/heads/main/github-home-enhancer.user.js
 // ==/UserScript==
@@ -20,7 +19,11 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '1.1.3';
+  // NOTE: Do NOT use @inject-into page on github.com.
+  // GitHub CSP is script-src github.githubassets.com only — page-context
+  // injection is refused, and the whole userscript fails to run.
+
+  const SCRIPT_VERSION = '1.1.4';
   const ROOT_ID = 'gh-home-enhancer-workbench';
   const ACTIVE_CLASS = 'gh-home-enhancer-active';
   const HOME_PATHS = new Set(['/', '', '/dashboard']);
@@ -33,23 +36,31 @@
   const MEMORY_REFRESH_MS = 5 * 60 * 1000;    // in-page release refresh interval
   const BODY_MAX_HEIGHT = 200;                // px, release notes truncation
   const ATOM_NS = 'http://www.w3.org/2005/Atom';
+  const DOM_VERSION_ATTR = 'data-ghg-home-enhancer';
+  const DOM_CMD_ATTR = 'data-ghg-cmd';
+  const DOM_STATE_ATTR = 'data-ghg-state';
 
   let lastData = null;
   let lastDataKey = '';
   let releaseLoadKey = '';
   let releaseRequestId = 0;
 
-  // Immediate boot marker so Safari console can verify the NEW file is injected.
-  // If you do not see this log, the userscript manager is still running an old copy.
-  try {
-    document.documentElement.setAttribute('data-ghg-home-enhancer', SCRIPT_VERSION);
-    console.info(`${LOG_PREFIX} v${SCRIPT_VERSION} injected`, {
-      href: location.href,
-      grant: 'none',
-    });
-  } catch (error) {
-    // ignore
+  function markVersionOnDom() {
+    try {
+      document.documentElement.setAttribute(DOM_VERSION_ATTR, SCRIPT_VERSION);
+    } catch (error) {
+      // ignore
+    }
   }
+
+  // Content-script world marker. DOM attributes are shared with the page even
+  // when window is isolated (Safari Userscripts). Console can read:
+  //   document.documentElement.getAttribute('data-ghg-home-enhancer')
+  markVersionOnDom();
+  console.info(`${LOG_PREFIX} v${SCRIPT_VERSION} injected`, {
+    href: location.href,
+    world: 'content-script-safe',
+  });
 
   const LABELS = {
     en: {
@@ -798,6 +809,7 @@
       lastData.releaseStatus = result.status;
       if (final) lastData.releaseFetchedAt = Date.now();
       renderWorkbench(lastData);
+      publishState();
     };
 
     loadStarredReleases(data, {
@@ -1024,6 +1036,8 @@
 
     bindWorkbenchEvents(root);
     document.body.classList.add(ACTIVE_CLASS);
+    markVersionOnDom();
+    publishState();
     console.debug(`${LOG_PREFIX} rendered`, {
       version: SCRIPT_VERSION,
       path: location.pathname,
@@ -1289,24 +1303,88 @@
     return { removed: removed.length, status: 'loading' };
   }
 
+  function publishState() {
+    const state = {
+      version: SCRIPT_VERSION,
+      lastDataKey,
+      releaseLoadKey,
+      releaseStatus: lastData?.releaseStatus || null,
+      releaseCount: lastData?.releaseItems?.length || 0,
+      releaseFetchedAt: lastData?.releaseFetchedAt || 0,
+      userName: lastData?.userName || null,
+      topTags: (lastData?.releaseItems || []).slice(0, 5).map((item) => `${item.repoName}@${item.tagName}`),
+    };
+    try {
+      document.documentElement.setAttribute(DOM_STATE_ATTR, JSON.stringify(state));
+    } catch (error) {
+      // ignore
+    }
+    return state;
+  }
+
+  function handleExternalCommand(raw) {
+    const cmd = String(raw || '').trim().toLowerCase();
+    if (!cmd) return;
+    if (cmd === 'refresh' || cmd === 'hard-refresh' || cmd === 'reload') {
+      hardRefreshReleases();
+    } else if (cmd === 'clear' || cmd === 'clear-cache') {
+      clearReleaseCaches();
+      publishState();
+    } else if (cmd === 'state' || cmd === 'ping') {
+      publishState();
+      console.info(`${LOG_PREFIX} state`, publishState());
+    }
+  }
+
+  function installCommandBridge() {
+    // Page-console bridge that does NOT inject a <script> (CSP-safe).
+    // From Safari Web Inspector on github.com:
+    //   document.documentElement.setAttribute('data-ghg-cmd', 'refresh')
+    //   document.documentElement.getAttribute('data-ghg-home-enhancer')  // "1.1.4"
+    //   JSON.parse(document.documentElement.getAttribute('data-ghg-state') || '{}')
+    try {
+      const observer = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          if (mutation.type !== 'attributes') continue;
+          if (mutation.attributeName !== DOM_CMD_ATTR) continue;
+          const value = document.documentElement.getAttribute(DOM_CMD_ATTR);
+          if (!value) continue;
+          document.documentElement.removeAttribute(DOM_CMD_ATTR);
+          handleExternalCommand(value);
+        }
+      });
+      observer.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: [DOM_CMD_ATTR],
+      });
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} command bridge failed`, error);
+    }
+
+    // Also accept bubbling CustomEvents from same document (works if worlds share events).
+    try {
+      document.addEventListener('ghg-home-enhancer', (event) => {
+        handleExternalCommand(event?.detail?.cmd || event?.detail || 'refresh');
+      });
+    } catch (error) {
+      // ignore
+    }
+  }
+
   function exposeApi() {
+    markVersionOnDom();
+    publishState();
+    installCommandBridge();
+
     const api = {
       version: SCRIPT_VERSION,
       refresh: hardRefreshReleases,
       clearCache: clearReleaseCaches,
-      getState: () => ({
-        version: SCRIPT_VERSION,
-        lastDataKey,
-        releaseLoadKey,
-        releaseStatus: lastData?.releaseStatus || null,
-        releaseCount: lastData?.releaseItems?.length || 0,
-        releaseFetchedAt: lastData?.releaseFetchedAt || 0,
-        userName: lastData?.userName || null,
-      }),
+      getState: publishState,
     };
 
-    // Prefer page window. Fall back to unsafeWindow for managers that sandbox
-    // even with @grant none (common on Safari Userscripts / some TM builds).
+    // Best-effort window export. Safari Userscripts often isolate window from
+    // the page console — if so, use the DOM attribute bridge above instead.
     const targets = [];
     try { targets.push(window); } catch (error) { /* ignore */ }
     try {
@@ -1323,12 +1401,6 @@
       } catch (error) {
         // ignore read-only window bindings
       }
-    }
-
-    try {
-      document.documentElement.setAttribute('data-ghg-home-enhancer', SCRIPT_VERSION);
-    } catch (error) {
-      // ignore
     }
   }
 
@@ -1355,3 +1427,4 @@
   window.addEventListener('turbo:render', scheduleBoot);
   window.addEventListener('pjax:end', scheduleBoot);
 })();
+
