@@ -2,7 +2,7 @@
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
 // @namespace    https://github.com/ssfun/userscripts
-// @version      1.1.4
+// @version      1.1.5
 // @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库的 Release 动态。
 // @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with a Release Radar for starred repositories.
 // @author       sfun
@@ -23,7 +23,7 @@
   // GitHub CSP is script-src github.githubassets.com only — page-context
   // injection is refused, and the whole userscript fails to run.
 
-  const SCRIPT_VERSION = '1.1.4';
+  const SCRIPT_VERSION = '1.1.5';
   const ROOT_ID = 'gh-home-enhancer-workbench';
   const ACTIVE_CLASS = 'gh-home-enhancer-active';
   const HOME_PATHS = new Set(['/', '', '/dashboard']);
@@ -39,6 +39,13 @@
   const DOM_VERSION_ATTR = 'data-ghg-home-enhancer';
   const DOM_CMD_ATTR = 'data-ghg-cmd';
   const DOM_STATE_ATTR = 'data-ghg-state';
+  // Stars page is ordered by "recently starred", NOT release activity.
+  // Native dashboard already surfaces recent releases across ALL stars —
+  // we scrape those as priority seeds so old-but-active repos aren't missed.
+  // How many starred-repo pages to scrape (≈30 repos/page).
+  // Bump this if a recently-released repo is missing from Release Radar —
+  // stars page is ordered by "when you starred", not by release activity.
+  const STARS_MAX_PAGES = 15;                 // ~450 recently-starred repos
 
   let lastData = null;
   let lastDataKey = '';
@@ -511,7 +518,7 @@
 
     const repos = [];
     let page = 1;
-    const maxPages = 7; // ~210 repos at 30/page
+    const maxPages = STARS_MAX_PAGES; // change STARS_MAX_PAGES above
 
     while (page <= maxPages) {
       const url = `https://github.com/${encodeURIComponent(userName)}?tab=stars&page=${page}`;
@@ -564,6 +571,12 @@
     const uniqueRepos = uniqueBy(repos, (repo) => repo.name);
     if (uniqueRepos.length) {
       cacheSet(cacheKey, uniqueRepos, STARS_CACHE_TTL);
+      console.debug(`${LOG_PREFIX} starred repos scraped`, {
+        pages: page,
+        maxPages,
+        count: uniqueRepos.length,
+        force,
+      });
       return uniqueRepos;
     }
 
@@ -701,7 +714,9 @@
   }
 
   async function loadStarredReleases(data, { force = false, onPartial } = {}) {
-    const starredRepos = await fetchStarredRepos(data.userName, { force: false });
+    // force also re-scrapes the stars list — otherwise STARS_MAX_PAGES changes
+    // and newly-starred / older-starred repos stay invisible for up to 6h.
+    const starredRepos = await fetchStarredRepos(data.userName, { force });
     if (!starredRepos.length) {
       return { status: 'empty', items: [], revalidated: true };
     }
