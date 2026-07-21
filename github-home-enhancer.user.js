@@ -2,7 +2,7 @@
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
 // @namespace    https://github.com/ssfun/userscripts
-// @version      1.1.1
+// @version      1.1.2
 // @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库的 Release 动态。
 // @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with a Release Radar for starred repositories.
 // @author       sfun
@@ -12,8 +12,8 @@
 // @match        https://github.com/*
 // @run-at       document-idle
 // @grant        none
-// @downloadURL https://github.com/ssfun/userscripts/raw/refs/heads/main/gitHub-home-enhancer.user.js
-// @updateURL https://github.com/ssfun/userscripts/raw/refs/heads/main/gitHub-home-enhancer.user.js
+// @downloadURL https://github.com/ssfun/userscripts/raw/refs/heads/main/github-home-enhancer.user.js
+// @updateURL https://github.com/ssfun/userscripts/raw/refs/heads/main/github-home-enhancer.user.js
 // ==/UserScript==
 
 (function () {
@@ -25,8 +25,12 @@
   const LOG_PREFIX = '[GitHub Home Enhancer]';
   const CACHE_PREFIX = 'ghg-release-radar-';
   const STARS_CACHE_TTL = 6 * 3600 * 1000;   // 6 hours
-  const RELEASES_CACHE_TTL = 1800 * 1000;     // 0.5 hour
+  const RELEASES_CACHE_TTL = 1800 * 1000;     // 0.5 hour hard TTL
+  const RELEASES_SOFT_TTL = 5 * 60 * 1000;    // 5 min: show cache, revalidate in background
+  const RELEASES_ERROR_TTL = 60 * 1000;       // transient errors: retry soon
+  const MEMORY_REFRESH_MS = 5 * 60 * 1000;    // in-page release refresh interval
   const BODY_MAX_HEIGHT = 200;                // px, release notes truncation
+  const ATOM_NS = 'http://www.w3.org/2005/Atom';
 
   let lastData = null;
   let lastDataKey = '';
@@ -228,7 +232,7 @@
   // responses (releases.atom / ?tab=stars), so after localStorage expires we
   // can still keep serving stale feed HTML/XML for a long time.
 
-  function cacheGet(key) {
+  function cacheRead(key) {
     try {
       const raw = localStorage.getItem(CACHE_PREFIX + key);
       if (!raw) return null;
@@ -237,43 +241,146 @@
         localStorage.removeItem(CACHE_PREFIX + key);
         return null;
       }
-      if (Date.now() > Number(parsed.expires)) {
+      const expires = Number(parsed.expires);
+      const cachedAt = Number(parsed.cachedAt || (expires - RELEASES_CACHE_TTL));
+      if (!Number.isFinite(expires)) {
         localStorage.removeItem(CACHE_PREFIX + key);
         return null;
       }
-      return parsed.data;
+      return {
+        data: parsed.data,
+        expires,
+        cachedAt: Number.isFinite(cachedAt) ? cachedAt : 0,
+        age: Math.max(0, Date.now() - (Number.isFinite(cachedAt) ? cachedAt : 0)),
+        expired: Date.now() > expires,
+      };
     } catch (error) {
       return null;
     }
   }
 
+  function cacheGet(key, { allowExpired = false } = {}) {
+    const entry = cacheRead(key);
+    if (!entry) return null;
+    if (entry.expired) {
+      if (!allowExpired) {
+        localStorage.removeItem(CACHE_PREFIX + key);
+        return null;
+      }
+      return entry.data;
+    }
+    return entry.data;
+  }
+
   function cacheSet(key, data, ttl) {
     try {
+      const now = Date.now();
       localStorage.setItem(CACHE_PREFIX + key, JSON.stringify({
         data,
-        expires: Date.now() + ttl,
-        cachedAt: Date.now(),
+        expires: now + ttl,
+        cachedAt: now,
       }));
     } catch (error) {
       // localStorage quota exceeded / private mode — silently ignore
     }
   }
 
+  function cacheRemove(key) {
+    try {
+      localStorage.removeItem(CACHE_PREFIX + key);
+    } catch (error) {
+      // ignore
+    }
+  }
+
   /** Same-origin GitHub fetch that avoids Safari HTTP cache stickiness. */
   async function fetchGithub(url, init = {}) {
-    const bust = `_ghg=${Date.now()}`;
+    const bust = `_ghg=${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const joined = url.includes('?') ? `${url}&${bust}` : `${url}?${bust}`;
     const { headers: initHeaders, ...rest } = init;
-    return fetch(joined, {
-      ...rest,
-      credentials: 'same-origin',
-      cache: 'no-store',
-      headers: {
-        'Cache-Control': 'no-cache',
-        Pragma: 'no-cache',
-        ...(initHeaders || {}),
-      },
+    const headers = {
+      'Cache-Control': 'no-cache, no-store, max-age=0',
+      Pragma: 'no-cache',
+      ...(initHeaders || {}),
+    };
+
+    // Prefer Request + cache:'reload' so Safari doesn't reuse disk cache by URL path.
+    try {
+      const request = new Request(joined, {
+        method: 'GET',
+        credentials: 'same-origin',
+        cache: 'reload',
+        headers,
+      });
+      return await fetch(request);
+    } catch (error) {
+      return fetch(joined, {
+        ...rest,
+        method: 'GET',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers,
+      });
+    }
+  }
+
+  // ── Atom helpers (Safari-safe) ─────────────────────────────────────────
+  // GitHub Atom uses a default namespace. Safari's querySelector() often fails
+  // to match namespaced nodes; getElementsByTagName(localName) is reliable.
+
+  function atomElements(root, localName) {
+    if (!root) return [];
+    if (typeof root.getElementsByTagNameNS === 'function') {
+      const namespaced = root.getElementsByTagNameNS(ATOM_NS, localName);
+      if (namespaced && namespaced.length) return Array.from(namespaced);
+    }
+    return Array.from(root.getElementsByTagName(localName));
+  }
+
+  function atomElement(root, localName) {
+    return atomElements(root, localName)[0] || null;
+  }
+
+  function atomText(root, localName) {
+    return compact(atomElement(root, localName)?.textContent || '');
+  }
+
+  function atomLinkHref(entry) {
+    const links = atomElements(entry, 'link');
+    if (!links.length) return '';
+    const alternate = links.find((link) => {
+      const rel = (link.getAttribute('rel') || 'alternate').toLowerCase();
+      return rel === 'alternate' || rel.split(/\s+/).includes('alternate');
     });
+    return (alternate || links[0]).getAttribute('href') || '';
+  }
+
+  function atomContentHtml(entry) {
+    const contentEl = atomElement(entry, 'content') || atomElement(entry, 'summary');
+    if (!contentEl) return '';
+    // Prefer textContent: Atom usually stores HTML as escaped character data.
+    // Fall back to innerHTML when the parser already expanded child nodes.
+    const raw = contentEl.textContent && contentEl.textContent.trim()
+      ? contentEl.textContent
+      : contentEl.innerHTML;
+    return raw || '';
+  }
+
+  function parseAtomDocument(xml) {
+    const attempts = ['application/xml', 'text/xml'];
+    for (const type of attempts) {
+      const doc = new DOMParser().parseFromString(xml, type);
+      if (doc.querySelector('parsererror')) continue;
+      const entries = atomElements(doc, 'entry');
+      if (entries.length) return { doc, entries };
+      // Keep a valid empty doc rather than failing hard — repo may have no releases.
+      if (doc.documentElement) return { doc, entries };
+    }
+
+    // Last resort: parse as HTML so CSS selectors ignore XML namespaces.
+    const htmlDoc = new DOMParser().parseFromString(xml, 'text/html');
+    const entries = Array.from(htmlDoc.querySelectorAll('entry'));
+    return { doc: htmlDoc, entries };
   }
 
   // ── Repo collection (left sidebar) ────────────────────────────────────
@@ -366,9 +473,12 @@
 
   // ── Starred repos & releases fetching ─────────────────────────────────
 
-  async function fetchStarredRepos(userName) {
-    const cached = cacheGet('starred-repos');
-    if (cached) return cached;
+  async function fetchStarredRepos(userName, { force = false } = {}) {
+    const cacheKey = 'starred-repos';
+    if (!force) {
+      const cached = cacheGet(cacheKey);
+      if (cached?.length) return cached;
+    }
 
     const repos = [];
     let page = 1;
@@ -376,8 +486,19 @@
 
     while (page <= maxPages) {
       const url = `https://github.com/${encodeURIComponent(userName)}?tab=stars&page=${page}`;
-      const response = await fetchGithub(url);
-      if (!response.ok) break;
+      let response;
+      try {
+        response = await fetchGithub(url, {
+          headers: { Accept: 'text/html,application/xhtml+xml' },
+        });
+      } catch (error) {
+        console.warn(`${LOG_PREFIX} starred page fetch failed`, page, error);
+        break;
+      }
+      if (!response.ok) {
+        console.warn(`${LOG_PREFIX} starred page HTTP ${response.status}`, page);
+        break;
+      }
 
       const html = await response.text();
       const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -385,6 +506,8 @@
         'h3 a[href^="/"]',
         'a[data-hovercard-type="repository"]',
         '.d-inline-block h3 a',
+        '#user-starred-repos h3 a',
+        '[data-repository-hovercards-enabled] h3 a',
       ].join(',')));
 
       if (!repoLinks.length) break;
@@ -411,60 +534,110 @@
 
     const uniqueRepos = uniqueBy(repos, (repo) => repo.name);
     if (uniqueRepos.length) {
-      cacheSet('starred-repos', uniqueRepos, STARS_CACHE_TTL);
+      cacheSet(cacheKey, uniqueRepos, STARS_CACHE_TTL);
+      return uniqueRepos;
     }
-    return uniqueRepos;
+
+    // Keep previous stars list if a forced/hard refresh returned nothing (rate limit / HTML change).
+    const stale = cacheGet(cacheKey, { allowExpired: true });
+    if (stale?.length) {
+      console.warn(`${LOG_PREFIX} starred scrape empty; reusing stale list (${stale.length})`);
+      return stale;
+    }
+    return [];
   }
 
-  async function fetchRepoReleases(repo) {
+  function mapAtomEntry(entry, repo) {
+    const title = atomText(entry, 'title');
+    const link = atomLinkHref(entry);
+    const updated = atomText(entry, 'updated') || atomText(entry, 'published');
+    const authorNode = atomElement(entry, 'author');
+    const author = (authorNode ? atomText(authorNode, 'name') : '') || repo.owner;
+    const bodyRaw = atomContentHtml(entry);
+
+    const tagMatch = link.match(/\/releases\/tag\/(.+)$/);
+    const tagName = tagMatch ? decodeURIComponent(tagMatch[1]) : title;
+    if (!tagName && !updated) return null;
+
+    return {
+      id: `release-${repo.name}-${tagName || updated}`,
+      actor: author,
+      actorAvatar: githubAvatarUrl(repo.owner),
+      createdAt: updated,
+      href: link || repo.href,
+      tagName: tagName || title || 'release',
+      releaseName: title,
+      repoName: repo.name,
+      repoOwner: repo.owner,
+      bodyHtml: sanitizeReleaseHtml(bodyRaw),
+    };
+  }
+
+  async function fetchRepoReleases(repo, { force = false } = {}) {
     const cacheKey = `releases-${repo.name}`;
-    const cached = cacheGet(cacheKey);
-    if (cached) return cached;
+    const cachedEntry = cacheRead(cacheKey);
+
+    if (!force && cachedEntry && !cachedEntry.expired) {
+      // Soft TTL: serve cache immediately, but let callers revalidate in background.
+      return {
+        items: Array.isArray(cachedEntry.data) ? cachedEntry.data : [],
+        fromCache: true,
+        softStale: cachedEntry.age > RELEASES_SOFT_TTL,
+        age: cachedEntry.age,
+      };
+    }
+
+    if (!force && cachedEntry?.expired) {
+      // Drop hard-expired entries so we don't keep reusing them accidentally.
+      cacheRemove(cacheKey);
+    }
 
     const url = `https://github.com/${repo.name}/releases.atom`;
-    const response = await fetchGithub(url);
-    if (!response.ok) {
+    let response;
+    try {
+      response = await fetchGithub(url, {
+        headers: { Accept: 'application/atom+xml, application/xml, text/xml, */*;q=0.1' },
+      });
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} release fetch failed`, repo.name, error);
+      const stale = cacheGet(cacheKey, { allowExpired: true });
+      if (Array.isArray(stale)) {
+        return { items: stale, fromCache: true, softStale: true, error: true };
+      }
+      return { items: [], fromCache: false, softStale: false, error: true };
+    }
+
+    if (response.status === 404) {
+      // Repo truly has no releases feed.
       cacheSet(cacheKey, [], RELEASES_CACHE_TTL);
-      return [];
+      return { items: [], fromCache: false, softStale: false };
+    }
+
+    if (!response.ok) {
+      // 429 / 5xx / auth glitches: short retry window, keep stale data if any.
+      console.warn(`${LOG_PREFIX} release HTTP ${response.status}`, repo.name);
+      cacheSet(cacheKey, cacheGet(cacheKey, { allowExpired: true }) || [], RELEASES_ERROR_TTL);
+      const stale = cacheGet(cacheKey, { allowExpired: true });
+      if (Array.isArray(stale) && stale.length) {
+        return { items: stale, fromCache: true, softStale: true, error: true };
+      }
+      return { items: [], fromCache: false, softStale: false, error: true };
     }
 
     const xml = await response.text();
-    const doc = new DOMParser().parseFromString(xml, 'application/xml');
-    if (doc.querySelector('parsererror')) {
-      cacheSet(cacheKey, [], RELEASES_CACHE_TTL);
-      return [];
+    if (!xml || !xml.includes('<')) {
+      cacheSet(cacheKey, [], RELEASES_ERROR_TTL);
+      return { items: [], fromCache: false, softStale: false, error: true };
     }
 
-    const entries = Array.from(doc.querySelectorAll('entry'));
-    const releases = entries.slice(0, 3).map((entry) => {
-      const title = compact(entry.querySelector('title')?.textContent || '');
-      const link = entry.querySelector('link[rel="alternate"]')?.getAttribute('href')
-        || entry.querySelector('link')?.getAttribute('href')
-        || '';
-      const updated = entry.querySelector('updated')?.textContent || '';
-      const author = compact(entry.querySelector('author name')?.textContent || '') || repo.owner;
-      const contentEl = entry.querySelector('content');
-      const bodyRaw = contentEl?.textContent || '';
-
-      const tagMatch = link.match(/\/releases\/tag\/(.+)$/);
-      const tagName = tagMatch ? decodeURIComponent(tagMatch[1]) : title;
-
-      return {
-        id: `release-${repo.name}-${tagName}`,
-        actor: author,
-        actorAvatar: githubAvatarUrl(repo.owner),
-        createdAt: updated,
-        href: link || repo.href,
-        tagName,
-        releaseName: title,
-        repoName: repo.name,
-        repoOwner: repo.owner,
-        bodyHtml: sanitizeReleaseHtml(bodyRaw),
-      };
-    });
+    const { entries } = parseAtomDocument(xml);
+    const releases = entries
+      .slice(0, 3)
+      .map((entry) => mapAtomEntry(entry, repo))
+      .filter(Boolean);
 
     cacheSet(cacheKey, releases, RELEASES_CACHE_TTL);
-    return releases;
+    return { items: releases, fromCache: false, softStale: false };
   }
 
   async function fetchAllWithConcurrency(items, fetchFn, concurrency = 5) {
@@ -477,7 +650,7 @@
         try {
           results[current] = await fetchFn(items[current]);
         } catch (error) {
-          results[current] = [];
+          results[current] = { items: [], fromCache: false, softStale: false, error: true };
         }
       }
     }
@@ -490,23 +663,81 @@
     return results;
   }
 
-  async function loadStarredReleases(data) {
-    const starredRepos = await fetchStarredRepos(data.userName);
-    if (!starredRepos.length) {
-      return { status: 'empty', items: [] };
-    }
-
-    const allReleases = await fetchAllWithConcurrency(starredRepos, fetchRepoReleases, 5);
-
-    const items = allReleases
+  function assembleReleaseItems(releaseLists) {
+    return releaseLists
       .flat()
       .filter((item) => item && item.createdAt)
       .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
       .slice(0, 60);
+  }
+
+  async function loadStarredReleases(data, { force = false, onPartial } = {}) {
+    const starredRepos = await fetchStarredRepos(data.userName, { force: false });
+    if (!starredRepos.length) {
+      return { status: 'empty', items: [], revalidated: true };
+    }
+
+    // Pass 1: prefer localStorage. Fresh cache paints immediately; missing/expired hit network.
+    const firstPass = await fetchAllWithConcurrency(
+      starredRepos,
+      (repo) => fetchRepoReleases(repo, { force: false }),
+      6
+    );
+
+    let networkHits = firstPass.filter((result) => result && !result.fromCache && !result.error).length;
+    const softStaleRepos = starredRepos.filter((_, index) => firstPass[index]?.softStale);
+    let releaseLists = firstPass.map((result) => (result?.items ? result.items : []));
+    let items = assembleReleaseItems(releaseLists);
+
+    // Paint cached cards ASAP, then revalidate soft-stale repos in the background path.
+    if (typeof onPartial === 'function' && items.length) {
+      try {
+        onPartial({ status: 'ready', items, partial: true });
+      } catch (error) {
+        // ignore partial render failures
+      }
+    }
+
+    // Pass 2: revalidate soft-stale caches, or everything when force=true.
+    const needsRefresh = force
+      ? starredRepos
+      : softStaleRepos;
+
+    if (needsRefresh.length) {
+      const refreshed = await fetchAllWithConcurrency(
+        needsRefresh,
+        (repo) => fetchRepoReleases(repo, { force: true }),
+        4
+      );
+      const refreshMap = new Map(needsRefresh.map((repo, i) => [repo.name, refreshed[i]]));
+      releaseLists = starredRepos.map((repo, index) => {
+        const updated = refreshMap.get(repo.name);
+        if (updated) {
+          if (!updated.error && !updated.fromCache) networkHits += 1;
+          // Keep previous cards if a forced refresh failed transiently.
+          if (updated.error && !(updated.items && updated.items.length)) {
+            return firstPass[index]?.items || [];
+          }
+          return updated.items || [];
+        }
+        return firstPass[index]?.items || [];
+      });
+      items = assembleReleaseItems(releaseLists);
+    }
+
+    console.debug(`${LOG_PREFIX} releases loaded`, {
+      repos: starredRepos.length,
+      items: items.length,
+      networkHits,
+      softStale: softStaleRepos.length,
+      refreshed: needsRefresh.length,
+      force,
+    });
 
     return {
       status: items.length ? 'ready' : 'empty',
       items,
+      revalidated: true,
     };
   }
 
@@ -527,6 +758,7 @@
       users: usersFromRepos(repos, userName, avatar?.src || ''),
       releaseItems: [],
       releaseStatus: 'loading',
+      releaseFetchedAt: 0,
       repoCount: repos.length,
       today: dateDaysAgo(0),
     };
@@ -536,26 +768,39 @@
     return `${data.userName}|${data.repos.map((repo) => repo.name).join(',')}`;
   }
 
-  function loadReleasesFor(data, key) {
-    if (releaseLoadKey === key) return;
+  function loadReleasesFor(data, key, { force = false } = {}) {
+    // Allow a forced refresh to interrupt an in-flight soft load for the same key.
+    if (!force && releaseLoadKey === key) return;
     releaseLoadKey = key;
     const requestId = ++releaseRequestId;
 
-    loadStarredReleases(data)
+    const applyResult = (result, { final = false } = {}) => {
+      if (requestId !== releaseRequestId || key !== lastDataKey || !lastData) return;
+      lastData.releaseItems = result.items;
+      lastData.releaseStatus = result.status;
+      if (final) lastData.releaseFetchedAt = Date.now();
+      renderWorkbench(lastData);
+    };
+
+    loadStarredReleases(data, {
+      force,
+      onPartial: (partial) => applyResult(partial, { final: false }),
+    })
       .then((result) => {
-        if (requestId !== releaseRequestId || key !== lastDataKey || !lastData) return;
-        lastData.releaseItems = result.items;
-        lastData.releaseStatus = result.status;
-        releaseLoadKey = '';
-        renderWorkbench(lastData);
+        applyResult(result, { final: true });
+        if (requestId === releaseRequestId) releaseLoadKey = '';
       })
       .catch((error) => {
         console.warn(`${LOG_PREFIX} failed to load starred releases`, error);
         if (requestId !== releaseRequestId || key !== lastDataKey || !lastData) return;
-        lastData.releaseItems = [];
-        lastData.releaseStatus = 'error';
+        // Keep previous items on refresh failure so the feed doesn't flash empty.
+        if (!lastData.releaseItems?.length) {
+          lastData.releaseItems = [];
+          lastData.releaseStatus = 'error';
+          renderWorkbench(lastData);
+        }
+        lastData.releaseFetchedAt = Date.now();
         releaseLoadKey = '';
-        renderWorkbench(lastData);
       });
   }
 
@@ -902,15 +1147,52 @@
     const data = collectGithubData();
     const key = dataKey(data);
     if (lastData && lastDataKey === key && document.getElementById(ROOT_ID)) {
-      if (lastData.releaseStatus === 'loading') loadReleasesFor(lastData, key);
+      if (lastData.releaseStatus === 'loading') {
+        loadReleasesFor(lastData, key);
+        return;
+      }
+      // Same SPA session / turbo revisit: soft-revalidate after MEMORY_REFRESH_MS
+      // instead of permanently freezing the first successful paint in memory.
+      const age = Date.now() - (lastData.releaseFetchedAt || 0);
+      if (age >= MEMORY_REFRESH_MS) {
+        loadReleasesFor(lastData, key, { force: false });
+      }
       return;
+    }
+
+    // Preserve already-fetched release cards across re-boots when only the
+    // left/right chrome needs re-scraping (e.g. mutation observer re-entry).
+    if (lastData && lastDataKey === key && lastData.releaseItems?.length) {
+      data.releaseItems = lastData.releaseItems;
+      data.releaseStatus = lastData.releaseStatus;
+      data.releaseFetchedAt = lastData.releaseFetchedAt || 0;
     }
 
     lastData = data;
     lastDataKey = key;
     renderWorkbench(lastData);
-    loadReleasesFor(lastData, key);
+
+    const needsLoad = lastData.releaseStatus === 'loading'
+      || !lastData.releaseFetchedAt
+      || (Date.now() - lastData.releaseFetchedAt) >= MEMORY_REFRESH_MS;
+    if (needsLoad) {
+      loadReleasesFor(lastData, key, { force: false });
+    }
   }
+
+  // Manual escape hatch for debugging in Safari Web Inspector:
+  //   window.__ghgRefreshReleases()
+  window.__ghgRefreshReleases = function ghgRefreshReleases() {
+    Object.keys(localStorage)
+      .filter((key) => key.startsWith(CACHE_PREFIX))
+      .forEach((key) => localStorage.removeItem(key));
+    lastData = null;
+    lastDataKey = '';
+    releaseLoadKey = '';
+    releaseRequestId += 1;
+    scheduleBoot();
+    console.info(`${LOG_PREFIX} cache cleared; reloading release radar`);
+  };
 
   let scheduled = false;
   function scheduleBoot() {
