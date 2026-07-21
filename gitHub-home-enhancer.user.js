@@ -1,15 +1,14 @@
 // ==UserScript==
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
-// @namespace    https://github.com/zhuxiongkai/github-home-enhancer
-// @version      1.1.0
+// @namespace    https://github.com/ssfun/userscripts
+// @version      1.1.1
 // @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库的 Release 动态。
 // @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with a Release Radar for starred repositories.
 // @author       sfun
 // @license      MIT
-// @homepageURL  https://github.com/zhuxiongkai/github-home-enhancer
-// @supportURL   https://github.com/zhuxiongkai/github-home-enhancer/issues
-// @contributionURL https://ifdian.net/a/zhuxk2005
+// @homepageURL  https://github.com/ssfun/userscripts
+// @supportURL   https://github.com/ssfun/userscripts/issues
 // @match        https://github.com/*
 // @run-at       document-idle
 // @grant        none
@@ -224,13 +223,21 @@
   }
 
   // ── Cache helpers ─────────────────────────────────────────────────────
+  // App-level TTL lives in localStorage. Network fetch itself must bypass the
+  // browser HTTP cache: Safari is especially sticky with same-origin GET
+  // responses (releases.atom / ?tab=stars), so after localStorage expires we
+  // can still keep serving stale feed HTML/XML for a long time.
 
   function cacheGet(key) {
     try {
       const raw = localStorage.getItem(CACHE_PREFIX + key);
       if (!raw) return null;
       const parsed = JSON.parse(raw);
-      if (Date.now() > parsed.expires) {
+      if (!parsed || typeof parsed !== 'object' || !('expires' in parsed)) {
+        localStorage.removeItem(CACHE_PREFIX + key);
+        return null;
+      }
+      if (Date.now() > Number(parsed.expires)) {
         localStorage.removeItem(CACHE_PREFIX + key);
         return null;
       }
@@ -245,10 +252,28 @@
       localStorage.setItem(CACHE_PREFIX + key, JSON.stringify({
         data,
         expires: Date.now() + ttl,
+        cachedAt: Date.now(),
       }));
     } catch (error) {
-      // localStorage quota exceeded — silently ignore
+      // localStorage quota exceeded / private mode — silently ignore
     }
+  }
+
+  /** Same-origin GitHub fetch that avoids Safari HTTP cache stickiness. */
+  async function fetchGithub(url, init = {}) {
+    const bust = `_ghg=${Date.now()}`;
+    const joined = url.includes('?') ? `${url}&${bust}` : `${url}?${bust}`;
+    const { headers: initHeaders, ...rest } = init;
+    return fetch(joined, {
+      ...rest,
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: {
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
+        ...(initHeaders || {}),
+      },
+    });
   }
 
   // ── Repo collection (left sidebar) ────────────────────────────────────
@@ -351,7 +376,7 @@
 
     while (page <= maxPages) {
       const url = `https://github.com/${encodeURIComponent(userName)}?tab=stars&page=${page}`;
-      const response = await fetch(url, { credentials: 'same-origin' });
+      const response = await fetchGithub(url);
       if (!response.ok) break;
 
       const html = await response.text();
@@ -397,7 +422,7 @@
     if (cached) return cached;
 
     const url = `https://github.com/${repo.name}/releases.atom`;
-    const response = await fetch(url, { credentials: 'same-origin' });
+    const response = await fetchGithub(url);
     if (!response.ok) {
       cacheSet(cacheKey, [], RELEASES_CACHE_TTL);
       return [];
