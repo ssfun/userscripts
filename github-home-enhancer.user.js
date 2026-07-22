@@ -2,9 +2,9 @@
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
 // @namespace    https://github.com/ssfun/userscripts
-// @version      1.1.7
-// @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库的 Release 动态。
-// @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with a Release Radar for starred repositories.
+// @version      2.0.0
+// @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库近 7 天有推送的 Release 动态。可选 PAT GraphQL / HTML 兜底。
+// @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with Release Radar for starred repos pushed in the last 7 days. Optional PAT GraphQL / HTML fallback.
 // @author       sfun
 // @license      MIT
 // @homepageURL  https://github.com/ssfun/userscripts
@@ -19,58 +19,51 @@
 (function () {
   'use strict';
 
-  // NOTE: Do NOT use @inject-into page on github.com.
-  // GitHub CSP is script-src github.githubassets.com only — page-context
-  // injection is refused, and the whole userscript fails to run.
-
-  const SCRIPT_VERSION = '1.1.7';
   const ROOT_ID = 'gh-home-enhancer-workbench';
   const ACTIVE_CLASS = 'gh-home-enhancer-active';
   const HOME_PATHS = new Set(['/', '', '/dashboard']);
   const LOG_PREFIX = '[GitHub Home Enhancer]';
   const CACHE_PREFIX = 'ghg-release-radar-';
-  const STARS_CACHE_TTL = 6 * 3600 * 1000;   // 6 hours
-  const RELEASES_CACHE_TTL = 1800 * 1000;     // 0.5 hour hard TTL
-  const RELEASES_SOFT_TTL = 5 * 60 * 1000;    // 5 min: show cache, revalidate in background
-  const RELEASES_ERROR_TTL = 60 * 1000;       // transient errors: retry soon
-  const MEMORY_REFRESH_MS = 5 * 60 * 1000;    // in-page release refresh interval
-  const BODY_MAX_HEIGHT = 200;                // px, release notes truncation
-  const ATOM_NS = 'http://www.w3.org/2005/Atom';
-  const DOM_VERSION_ATTR = 'data-ghg-home-enhancer';
-  const DOM_CMD_ATTR = 'data-ghg-cmd';
-  const DOM_STATE_ATTR = 'data-ghg-state';
-  // Stars page is ordered by "recently starred", NOT release activity.
-  // How many starred-repo pages to scrape (≈30 repos/page).
-  const STARS_MAX_PAGES = 15;                 // ~450 recently-starred repos
-  const RELEASE_FEED_LIMIT = 80;
-  const RELEASES_PER_REPO = 3;
-  const FEED_SEED_LIMIT = 50;
+  const TOKEN_STORAGE_KEY = 'ghg-github-token';
+  const GRAPHQL_ENDPOINT = 'https://api.github.com/graphql';
+  const GRAPHQL_CACHE_KEY = 'graphql-feed-v4';
+  const GRAPHQL_ACTIVE_CACHE_KEY = 'graphql-active-repos-v1';
+  const HTML_FEED_CACHE_KEY = 'html-feed-v1';
+  const STARS_CACHE_KEY = 'starred-repos-v2';
+  const STYLE_ID = 'gh-home-enhancer-styles';
 
-  // Snapshot of native dashboard release activity, captured before we hide the feed.
-  let feedReleaseSeeds = [];
-  let feedReleaseHints = [];
+  const STARS_CACHE_TTL = 6 * 3600 * 1000;
+  const RELEASES_CACHE_TTL = 1800 * 1000;
+  const EMPTY_RELEASES_CACHE_TTL = 24 * 3600 * 1000;
+  const STALE_RELEASES_CACHE_TTL = 12 * 3600 * 1000;
+  const GRAPHQL_CACHE_TTL = 1800 * 1000;
+  const GRAPHQL_ACTIVE_CACHE_TTL = 1800 * 1000;
+  const GRAPHQL_PAGE_SIZE = 100;
+  const GRAPHQL_MAX_PAGES = 6;
+  const GRAPHQL_RELEASE_BATCH = 25;
+  const GRAPHQL_RELEASE_CONCURRENCY = 4;
+  const GRAPHQL_BODY_BATCH = 25;
+  const GRAPHQL_BODY_CONCURRENCY = 2;
+  const FEED_LIMIT = 60;
+  const ACTIVE_REPO_DAYS = 7;
+  const ACTIVE_MS = ACTIVE_REPO_DAYS * 24 * 3600 * 1000;
+  const HTML_ATOM_CONCURRENCY = 10;
+  const HTML_HOT_STAR_PAGES = 2;
+  const HTML_FULL_STARS_MAX_PAGES = 15;
+  const BODY_MAX_HEIGHT = 280; // px, scrollable release notes viewport
+  const TOKEN_CREATE_URL = 'https://github.com/settings/tokens/new?description=GitHub%20Home%20Enhancer&scopes=read:user';
+  const REPO_NAME_RE = /^[A-Za-z0-9_.-]+$/;
 
   let lastData = null;
   let lastDataKey = '';
   let releaseLoadKey = '';
   let releaseRequestId = 0;
-
-  function markVersionOnDom() {
-    try {
-      document.documentElement.setAttribute(DOM_VERSION_ATTR, SCRIPT_VERSION);
-    } catch (error) {
-      // ignore
-    }
-  }
-
-  // Content-script world marker. DOM attributes are shared with the page even
-  // when window is isolated (Safari Userscripts). Console can read:
-  //   document.documentElement.getAttribute('data-ghg-home-enhancer')
-  markVersionOnDom();
-  console.info(`${LOG_PREFIX} v${SCRIPT_VERSION} injected`, {
-    href: location.href,
-    world: 'content-script-safe',
-  });
+  let settingsOpen = false;
+  let eventsBound = false;
+  let stylesInjected = false;
+  let cachedToken = null; // null = unread; string = value (may be '')
+  let pendingStatusMessage = '';
+  let legacyStarsCacheCleared = false;
 
   const LABELS = {
     en: {
@@ -105,8 +98,21 @@
       hoursAgo: 'hours ago',
       daysAgo: 'days ago',
       monthsAgo: 'months ago',
-      refresh: 'Refresh',
-      refreshing: 'Refreshing…',
+      settings: 'Settings',
+      apiToken: 'GitHub Token',
+      apiTokenHint: 'Optional personal access token for official GraphQL (fast path). Without it, the script scrapes stars pages + release Atom feeds. Note: GitHub’s same-origin /_graphql only accepts GitHub’s own persisted queries, so freeform session GraphQL is not usable.',
+      apiTokenScopes: 'Classic: no scope needed for public stars; add "repo" for private starred repos. Fine-grained: Account permissions → Starring (Read), plus repository metadata read.',
+      tokenPlaceholder: 'ghp_… or github_pat_…',
+      saveToken: 'Save',
+      clearToken: 'Clear',
+      createToken: 'Create token',
+      refreshFeed: 'Refresh',
+      tokenConfigured: 'GraphQL',
+      tokenMissing: 'HTML scrape',
+      tokenSaved: 'Token saved. Refreshing…',
+      tokenCleared: 'Token cleared. Falling back to HTML scrape…',
+      refreshing: 'Updating…',
+      tokenInvalid: 'Token rejected by GitHub. Check the value or scopes.',
     },
     zh: {
       myWorkspace: '我的工作台',
@@ -140,8 +146,21 @@
       hoursAgo: '小时前',
       daysAgo: '天前',
       monthsAgo: '个月前',
-      refresh: '刷新',
-      refreshing: '刷新中…',
+      settings: '设置',
+      apiToken: 'GitHub Token',
+      apiTokenHint: '可选填写 Personal Access Token，走官方 GraphQL（快路径）。不填则抓取 Stars 页 + Release Atom。说明：GitHub 网页同域 /_graphql 只接受站内预注册查询，自定义 Session GraphQL 不可用。',
+      apiTokenScopes: 'Classic：公开 Star 可不勾选 scope；私有 Star 需 repo。Fine-grained：Account → Starring（Read），并允许读取仓库元数据。',
+      tokenPlaceholder: 'ghp_… 或 github_pat_…',
+      saveToken: '保存',
+      clearToken: '清除',
+      createToken: '创建 Token',
+      refreshFeed: '刷新',
+      tokenConfigured: 'GraphQL',
+      tokenMissing: 'HTML 抓取',
+      tokenSaved: 'Token 已保存，正在刷新…',
+      tokenCleared: 'Token 已清除，回退到 HTML 抓取…',
+      refreshing: '更新中…',
+      tokenInvalid: 'Token 被 GitHub 拒绝，请检查内容或权限。',
     },
   };
 
@@ -174,6 +193,14 @@
 
   function iconTag() {
     return '<svg aria-hidden="true" viewBox="0 0 16 16"><path d="M1 7.775V2.75C1 1.784 1.784 1 2.75 1h5.025c.464 0 .91.184 1.238.513l6.25 6.25a1.75 1.75 0 0 1 0 2.474l-5.026 5.026a1.75 1.75 0 0 1-2.474 0l-6.25-6.25A1.752 1.752 0 0 1 1 7.775Zm1.5 0c0 .066.026.13.073.177l6.25 6.25a.25.25 0 0 0 .354 0l5.025-5.025a.25.25 0 0 0 0-.354l-6.25-6.25a.25.25 0 0 0-.177-.073H2.75a.25.25 0 0 0-.25.25ZM6 5a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"></path></svg>';
+  }
+
+  function iconGear() {
+    return '<svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 0a1.5 1.5 0 0 1 1.34.83l.35.78c.2.43.64.7 1.11.7h.1c.55 0 1.05.35 1.24.87l.27.75c.19.52.02 1.1-.4 1.43l-.68.52a1.27 1.27 0 0 0 0 2.04l.68.52c.42.33.59.91.4 1.43l-.27.75c-.19.52-.69.87-1.24.87h-.1a1.27 1.27 0 0 0-1.11.7l-.35.78A1.5 1.5 0 0 1 8 16a1.5 1.5 0 0 1-1.34-.83l-.35-.78a1.27 1.27 0 0 0-1.11-.7h-.1c-.55 0-1.05-.35-1.24-.87l-.27-.75a1.27 1.27 0 0 1 .4-1.43l.68-.52a1.27 1.27 0 0 0 0-2.04l-.68-.52a1.27 1.27 0 0 1-.4-1.43l.27-.75c.19-.52.69-.87 1.24-.87h.1c.47 0 .91-.27 1.11-.7l.35-.78A1.5 1.5 0 0 1 8 0Zm0 5a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"></path></svg>';
+  }
+
+  function iconRefresh() {
+    return '<svg aria-hidden="true" viewBox="0 0 16 16"><path d="M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z"></path></svg>';
   }
 
   // ── Utilities ──────────────────────────────────────────────────────────
@@ -234,20 +261,49 @@
     });
   }
 
-  /** Sanitize HTML from Atom feed <content> — allow safe tags only. */
+  function isValidRepoPart(value) {
+    return Boolean(value && REPO_NAME_RE.test(value));
+  }
+
+  function isWithinActiveWindow(value) {
+    if (!value) return false;
+    const ts = new Date(value).getTime();
+    return !Number.isNaN(ts) && Date.now() - ts <= ACTIVE_MS;
+  }
+
+  /** Run async mapper over items with a fixed concurrency pool. */
+  async function mapPool(items, mapper, concurrency = 5) {
+    if (!items.length) return [];
+    const results = new Array(items.length);
+    let index = 0;
+    const limit = Math.max(1, Math.min(concurrency, items.length));
+
+    async function worker() {
+      while (index < items.length) {
+        const current = index++;
+        try {
+          results[current] = await mapper(items[current], current);
+        } catch (error) {
+          results[current] = undefined;
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: limit }, () => worker()));
+    return results;
+  }
+
+  /** Sanitize HTML from Atom/GraphQL release notes — allow safe tags only. */
   function sanitizeReleaseHtml(raw) {
     if (!raw) return '';
     const doc = new DOMParser().parseFromString(raw, 'text/html');
-    // Remove dangerous elements
     doc.querySelectorAll('script,style,iframe,object,embed,form,input,textarea,button,link,meta').forEach((el) => el.remove());
-    // Remove event handler attributes
     doc.querySelectorAll('*').forEach((el) => {
       for (const attr of Array.from(el.attributes)) {
         if (attr.name.startsWith('on') || attr.name === 'style') {
           el.removeAttribute(attr.name);
         }
       }
-      // Rewrite relative links to absolute GitHub URLs
       if (el.tagName === 'A' && el.getAttribute('href')) {
         el.setAttribute('href', safeGithubUrl(el.getAttribute('href')));
         el.setAttribute('target', '_blank');
@@ -266,160 +322,75 @@
   }
 
   // ── Cache helpers ─────────────────────────────────────────────────────
-  // App-level TTL lives in localStorage. Network fetch itself must bypass the
-  // browser HTTP cache: Safari is especially sticky with same-origin GET
-  // responses (releases.atom / ?tab=stars), so after localStorage expires we
-  // can still keep serving stale feed HTML/XML for a long time.
 
-  function cacheRead(key) {
+  function cacheGet(key) {
+    const entry = cacheGetEntry(key);
+    if (!entry || entry.expired) return null;
+    return entry.data;
+  }
+
+  /** Return cached data even if expired (for SWR). */
+  function cacheGetEntry(key) {
     try {
       const raw = localStorage.getItem(CACHE_PREFIX + key);
       if (!raw) return null;
       const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object' || !('expires' in parsed)) {
-        localStorage.removeItem(CACHE_PREFIX + key);
-        return null;
-      }
-      const expires = Number(parsed.expires);
-      const cachedAt = Number(parsed.cachedAt || (expires - RELEASES_CACHE_TTL));
-      if (!Number.isFinite(expires)) {
-        localStorage.removeItem(CACHE_PREFIX + key);
-        return null;
-      }
       return {
         data: parsed.data,
-        expires,
-        cachedAt: Number.isFinite(cachedAt) ? cachedAt : 0,
-        age: Math.max(0, Date.now() - (Number.isFinite(cachedAt) ? cachedAt : 0)),
-        expired: Date.now() > expires,
+        expires: parsed.expires,
+        expired: Date.now() > parsed.expires,
       };
     } catch (error) {
       return null;
     }
   }
 
-  function cacheGet(key, { allowExpired = false } = {}) {
-    const entry = cacheRead(key);
-    if (!entry) return null;
-    if (entry.expired) {
-      if (!allowExpired) {
-        localStorage.removeItem(CACHE_PREFIX + key);
-        return null;
-      }
-      return entry.data;
-    }
-    return entry.data;
-  }
-
   function cacheSet(key, data, ttl) {
     try {
-      const now = Date.now();
       localStorage.setItem(CACHE_PREFIX + key, JSON.stringify({
         data,
-        expires: now + ttl,
-        cachedAt: now,
+        expires: Date.now() + ttl,
       }));
     } catch (error) {
-      // localStorage quota exceeded / private mode — silently ignore
+      // localStorage quota exceeded — silently ignore
     }
   }
 
-  function cacheRemove(key) {
+  function clearFeedCaches() {
     try {
-      localStorage.removeItem(CACHE_PREFIX + key);
+      Object.keys(localStorage).forEach((key) => {
+        if (key.startsWith(CACHE_PREFIX)) localStorage.removeItem(key);
+      });
     } catch (error) {
       // ignore
     }
   }
 
-  /** Same-origin GitHub fetch that avoids Safari HTTP cache stickiness. */
-  async function fetchGithub(url, init = {}) {
-    const bust = `_ghg=${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const joined = url.includes('?') ? `${url}&${bust}` : `${url}?${bust}`;
-    const { headers: initHeaders, ...rest } = init;
-    const headers = {
-      'Cache-Control': 'no-cache, no-store, max-age=0',
-      Pragma: 'no-cache',
-      ...(initHeaders || {}),
-    };
+  // ── Token helpers ──────────────────────────────────────────────────────
 
-    // Prefer Request + cache:'reload' so Safari doesn't reuse disk cache by URL path.
+  function getGithubToken() {
+    if (cachedToken !== null) return cachedToken;
     try {
-      const request = new Request(joined, {
-        method: 'GET',
-        credentials: 'same-origin',
-        cache: 'reload',
-        headers,
-      });
-      return await fetch(request);
+      cachedToken = compact(localStorage.getItem(TOKEN_STORAGE_KEY) || '');
     } catch (error) {
-      return fetch(joined, {
-        ...rest,
-        method: 'GET',
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers,
-      });
+      cachedToken = '';
+    }
+    return cachedToken;
+  }
+
+  function setGithubToken(token) {
+    try {
+      const value = compact(token);
+      cachedToken = value;
+      if (value) localStorage.setItem(TOKEN_STORAGE_KEY, value);
+      else localStorage.removeItem(TOKEN_STORAGE_KEY);
+    } catch (error) {
+      cachedToken = compact(token);
     }
   }
 
-  // ── Atom helpers (Safari-safe) ─────────────────────────────────────────
-  // GitHub Atom uses a default namespace. Safari's querySelector() often fails
-  // to match namespaced nodes; getElementsByTagName(localName) is reliable.
-
-  function atomElements(root, localName) {
-    if (!root) return [];
-    if (typeof root.getElementsByTagNameNS === 'function') {
-      const namespaced = root.getElementsByTagNameNS(ATOM_NS, localName);
-      if (namespaced && namespaced.length) return Array.from(namespaced);
-    }
-    return Array.from(root.getElementsByTagName(localName));
-  }
-
-  function atomElement(root, localName) {
-    return atomElements(root, localName)[0] || null;
-  }
-
-  function atomText(root, localName) {
-    return compact(atomElement(root, localName)?.textContent || '');
-  }
-
-  function atomLinkHref(entry) {
-    const links = atomElements(entry, 'link');
-    if (!links.length) return '';
-    const alternate = links.find((link) => {
-      const rel = (link.getAttribute('rel') || 'alternate').toLowerCase();
-      return rel === 'alternate' || rel.split(/\s+/).includes('alternate');
-    });
-    return (alternate || links[0]).getAttribute('href') || '';
-  }
-
-  function atomContentHtml(entry) {
-    const contentEl = atomElement(entry, 'content') || atomElement(entry, 'summary');
-    if (!contentEl) return '';
-    // Prefer textContent: Atom usually stores HTML as escaped character data.
-    // Fall back to innerHTML when the parser already expanded child nodes.
-    const raw = contentEl.textContent && contentEl.textContent.trim()
-      ? contentEl.textContent
-      : contentEl.innerHTML;
-    return raw || '';
-  }
-
-  function parseAtomDocument(xml) {
-    const attempts = ['application/xml', 'text/xml'];
-    for (const type of attempts) {
-      const doc = new DOMParser().parseFromString(xml, type);
-      if (doc.querySelector('parsererror')) continue;
-      const entries = atomElements(doc, 'entry');
-      if (entries.length) return { doc, entries };
-      // Keep a valid empty doc rather than failing hard — repo may have no releases.
-      if (doc.documentElement) return { doc, entries };
-    }
-
-    // Last resort: parse as HTML so CSS selectors ignore XML namespaces.
-    const htmlDoc = new DOMParser().parseFromString(xml, 'text/html');
-    const entries = Array.from(htmlDoc.querySelectorAll('entry'));
-    return { doc: htmlDoc, entries };
+  function hasGithubToken() {
+    return Boolean(getGithubToken());
   }
 
   // ── Repo collection (left sidebar) ────────────────────────────────────
@@ -446,7 +417,7 @@
       repo = textName;
     }
 
-    if (!owner || !repo || !/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo)) return null;
+    if (!isValidRepoPart(owner) || !isValidRepoPart(repo)) return null;
     const name = `${owner}/${repo}`;
     const container = link.closest('li') || link.parentElement;
     const isPrivate = Boolean(
@@ -500,577 +471,722 @@
     return `${Math.floor(days / 30)} ${t('monthsAgo')}`;
   }
 
-  function dateDaysAgo(days) {
-    const date = new Date();
-    date.setDate(date.getDate() - days);
-    return date.toLocaleDateString('en-CA', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).replace(/\//g, '-');
-  }
-
-  // ── Native dashboard feed seeds ───────────────────────────────────────
-  // GitHub's home feed already knows the newest releases across stars /
-  // follows. Stars page order is "when you starred", so a repo starred
-  // months ago but releasing today can still be missing from a pure stars
-  // scrape if selectors/pagination fail. We harvest release cards from the
-  // native feed (before we hide it) as high-priority repos + fallback cards.
-
-  function isValidRepoSlug(owner, repo) {
-    return Boolean(
-      owner
-      && repo
-      && /^[A-Za-z0-9_.-]+$/.test(owner)
-      && /^[A-Za-z0-9_.-]+$/.test(repo)
-      && !['settings', 'marketplace', 'explore', 'topics', 'orgs', 'users', 'login', 'signup'].includes(owner)
-    );
-  }
-
-  function repoFromPath(pathname) {
-    const parts = String(pathname || '').split('/').filter(Boolean);
-    if (parts.length < 2) return null;
-    const [owner, repo] = parts;
-    if (!isValidRepoSlug(owner, repo)) return null;
-    return {
-      name: `${owner}/${repo}`,
-      owner,
-      repo,
-      href: `https://github.com/${owner}/${repo}`,
-    };
-  }
-
-  function scrapeNativeFeedReleases(root = document) {
-    const seeds = [];
-    const hints = [];
-    const seenSeed = new Set();
-    const seenHint = new Set();
-
-    const pushSeed = (repoLike, source = 'feed') => {
-      if (!repoLike?.name || seenSeed.has(repoLike.name)) return;
-      seenSeed.add(repoLike.name);
-      seeds.push({ ...repoLike, source });
-    };
-
-    const pushHint = (item) => {
-      if (!item?.repoName || !item?.tagName) return;
-      const key = `${item.repoName}@${item.tagName}`;
-      if (seenHint.has(key)) return;
-      seenHint.add(key);
-      hints.push(item);
-    };
-
-    // 1) Direct release/tag links anywhere in the visible feed.
-    const releaseLinks = Array.from(root.querySelectorAll('a[href*="/releases/tag/"], a[href*="/releases/"]'));
-    for (const link of releaseLinks) {
-      let url;
-      try {
-        url = new URL(link.getAttribute('href') || link.href, location.origin);
-      } catch (error) {
-        continue;
-      }
-      if (url.hostname !== 'github.com') continue;
-      const parts = url.pathname.split('/').filter(Boolean);
-      // owner/repo/releases/tag/v1.2.3
-      if (parts.length < 4 || parts[2] !== 'releases') continue;
-      const repo = repoFromPath(`/${parts[0]}/${parts[1]}`);
-      if (!repo) continue;
-      pushSeed(repo, 'feed-link');
-
-      if (parts[3] === 'tag' && parts[4]) {
-        const tagName = decodeURIComponent(parts.slice(4).join('/'));
-        const card = link.closest('article, .body, .feed-item, [data-repository-hovercards-enabled], .TimelineItem, li, div');
-        const timeEl = card?.querySelector('relative-time, time');
-        const createdAt = timeEl?.getAttribute('datetime') || timeEl?.dateTime || timeEl?.getAttribute('title') || '';
-        const createdAtMs = parseTimestamp(createdAt);
-        pushHint({
-          id: `feed-${repo.name}-${tagName}`,
-          actor: repo.owner,
-          actorAvatar: githubAvatarUrl(repo.owner),
-          createdAt: createdAt || (createdAtMs ? new Date(createdAtMs).toISOString() : new Date().toISOString()),
-          createdAtMs: createdAtMs || Date.now(),
-          href: url.href,
-          tagName,
-          releaseName: tagName,
-          repoName: repo.name,
-          repoOwner: repo.owner,
-          bodyHtml: '',
-          source: 'native-feed',
-        });
-      }
-    }
-
-    // 2) Text cues: "released", "published a release", Chinese "发布了".
-    const textNodes = Array.from(root.querySelectorAll('article, .body, .feed-item, [class*="feed"], [class*="Feed"]'));
-    for (const node of textNodes) {
-      const text = compact(node.textContent || '');
-      if (!/(released|published a release|创建了|发布了)/i.test(text)) continue;
-      const repoLink = node.querySelector('a[data-hovercard-type="repository"], a[href^="/"][data-hydro-click], a[href*="/"]');
-      if (!repoLink) continue;
-      try {
-        const url = new URL(repoLink.getAttribute('href') || repoLink.href, location.origin);
-        const repo = repoFromPath(url.pathname);
-        if (repo) pushSeed(repo, 'feed-text');
-      } catch (error) {
-        // ignore
-      }
-    }
-
-    // 3) Hovercard-marked repository anchors near release verbs.
-    const repoAnchors = Array.from(root.querySelectorAll('a[data-hovercard-type="repository"]'));
-    for (const anchor of repoAnchors) {
-      const parentText = compact(anchor.closest('article, .body, .feed-item, div, li')?.textContent || '');
-      if (!/(released|release|发布)/i.test(parentText)) continue;
-      try {
-        const url = new URL(anchor.getAttribute('href') || anchor.href, location.origin);
-        const repo = repoFromPath(url.pathname);
-        if (repo) pushSeed(repo, 'feed-hovercard');
-      } catch (error) {
-        // ignore
-      }
-    }
-
-    return {
-      seeds: seeds.slice(0, FEED_SEED_LIMIT),
-      hints: hints
-        .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
-        .slice(0, FEED_SEED_LIMIT),
-    };
-  }
-
-  function captureNativeFeedSnapshot() {
-    // Prefer the live feed container. Fall back to whole document.
-    const root = document.querySelector('.feed-background, [data-target="feed-container"], main, body') || document;
-    const { seeds, hints } = scrapeNativeFeedReleases(root);
-    if (seeds.length) feedReleaseSeeds = seeds;
-    if (hints.length) feedReleaseHints = hints;
-    console.debug(`${LOG_PREFIX} native feed seeds`, {
-      seeds: feedReleaseSeeds.map((repo) => repo.name),
-      hints: feedReleaseHints.map((item) => `${item.repoName}@${item.tagName}`),
-    });
-    return { seeds: feedReleaseSeeds, hints: feedReleaseHints };
-  }
-
-  function mergeRepoLists(...lists) {
-    const seen = new Set();
-    const merged = [];
-    for (const list of lists) {
-      for (const repo of list || []) {
-        if (!repo?.name || seen.has(repo.name)) continue;
-        seen.add(repo.name);
-        merged.push({
-          name: repo.name,
-          owner: repo.owner,
-          repo: repo.repo,
-          href: repo.href || `https://github.com/${repo.name}`,
-          source: repo.source || 'stars',
-        });
-      }
-    }
-    return merged;
-  }
-
   // ── Starred repos & releases fetching ─────────────────────────────────
 
-  async function fetchStarredRepos(userName, { force = false } = {}) {
-    const cacheKey = 'starred-repos';
-    if (!force) {
-      const cached = cacheGet(cacheKey);
-      if (cached?.length) return cached;
+  /** Find the cursor-based "Next" link on GitHub's stars page. */
+  function findStarsNextUrl(doc) {
+    // Current GitHub stars UI: <div data-test-selector="pagination"> with BtnGroup Next
+    const pagination = doc.querySelector('[data-test-selector="pagination"]');
+    if (pagination) {
+      const nextBtn = Array.from(pagination.querySelectorAll('a.btn, a')).find((a) => {
+        const text = compact(a.textContent).toLowerCase();
+        const href = a.getAttribute('href') || '';
+        return (text === 'next' || href.includes('after='))
+          && !a.classList.contains('disabled')
+          && a.getAttribute('aria-disabled') !== 'true'
+          && !a.hasAttribute('disabled');
+      });
+      if (nextBtn?.getAttribute('href')) {
+        return safeGithubUrl(nextBtn.getAttribute('href'));
+      }
     }
 
-    const repos = [];
-    let page = 1;
-    const maxPages = STARS_MAX_PAGES; // change STARS_MAX_PAGES above
+    // Fallback: any Next / after= link (legacy or alternate layouts)
+    const candidates = Array.from(doc.querySelectorAll(
+      'a.next_page, a[rel="next"], .pagination a[href*="after="], a.btn.BtnGroup-item[href*="after="], a[href*="after="][href*="tab=stars"]'
+    ));
+    for (const link of candidates) {
+      const href = link.getAttribute('href');
+      if (!href) continue;
+      if (link.classList.contains('disabled') || link.getAttribute('aria-disabled') === 'true') continue;
+      const text = compact(link.textContent).toLowerCase();
+      if (text && text !== 'next' && !href.includes('after=')) continue;
+      return safeGithubUrl(href);
+    }
+    return null;
+  }
 
-    while (page <= maxPages) {
-      const url = `https://github.com/${encodeURIComponent(userName)}?tab=stars&page=${page}`;
-      let response;
-      try {
-        response = await fetchGithub(url, {
-          headers: { Accept: 'text/html,application/xhtml+xml' },
-        });
-      } catch (error) {
-        console.warn(`${LOG_PREFIX} starred page fetch failed`, page, error);
-        break;
-      }
-      if (!response.ok) {
-        console.warn(`${LOG_PREFIX} starred page HTTP ${response.status}`, page);
-        break;
-      }
+  function parseStarredReposFromDoc(doc) {
+    const repoLinks = Array.from(doc.querySelectorAll([
+      'h3 a[href^="/"]',
+      'a[data-hovercard-type="repository"]',
+      '.d-inline-block h3 a',
+    ].join(',')));
+
+    const repos = [];
+    for (const link of repoLinks) {
+      const href = link.getAttribute('href');
+      if (!href) continue;
+      const parts = href.split('/').filter(Boolean);
+      if (parts.length < 2) continue;
+      const [owner, repo] = parts;
+      if (!isValidRepoPart(owner) || !isValidRepoPart(repo)) continue;
+      repos.push({
+        name: `${owner}/${repo}`,
+        owner,
+        repo,
+        href: `https://github.com/${owner}/${repo}`,
+      });
+    }
+    return repos;
+  }
+
+  async function scrapeStarredRepoPages(userName, { maxPages = HTML_FULL_STARS_MAX_PAGES } = {}) {
+    const repos = [];
+    let nextUrl = `https://github.com/${encodeURIComponent(userName)}?tab=stars`;
+    let page = 0;
+
+    while (nextUrl && page < maxPages) {
+      page++;
+      const response = await fetch(nextUrl, { credentials: 'same-origin' });
+      if (!response.ok) break;
 
       const html = await response.text();
       const doc = new DOMParser().parseFromString(html, 'text/html');
-      const repoLinks = Array.from(doc.querySelectorAll([
-        'h3 a[href^="/"]',
-        'a[data-hovercard-type="repository"]',
-        '.d-inline-block h3 a',
-        '#user-starred-repos h3 a',
-        '[data-repository-hovercards-enabled] h3 a',
-      ].join(',')));
+      const pageRepos = parseStarredReposFromDoc(doc);
+      if (!pageRepos.length) break;
 
-      if (!repoLinks.length) break;
+      repos.push(...pageRepos);
 
-      for (const link of repoLinks) {
-        const href = link.getAttribute('href');
-        if (!href) continue;
-        const parts = href.split('/').filter(Boolean);
-        if (parts.length < 2) continue;
-        const [owner, repo] = parts;
-        if (!owner || !repo || !/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo)) continue;
-        repos.push({
-          name: `${owner}/${repo}`,
-          owner,
-          repo,
-          href: `https://github.com/${owner}/${repo}`,
-        });
-      }
-
-      const nextLink = doc.querySelector('a.next_page, a[rel="next"], .pagination a:last-child[href]');
-      if (!nextLink || nextLink.classList.contains('disabled') || nextLink.getAttribute('aria-disabled') === 'true') break;
-      page++;
+      const following = findStarsNextUrl(doc);
+      nextUrl = following && following !== nextUrl ? following : null;
     }
-
-    const uniqueRepos = uniqueBy(repos, (repo) => repo.name);
-    if (uniqueRepos.length) {
-      cacheSet(cacheKey, uniqueRepos, STARS_CACHE_TTL);
-      console.debug(`${LOG_PREFIX} starred repos scraped`, {
-        pages: page,
-        maxPages,
-        count: uniqueRepos.length,
-        force,
-      });
-      return uniqueRepos;
-    }
-
-    // Keep previous stars list if a forced/hard refresh returned nothing (rate limit / HTML change).
-    const stale = cacheGet(cacheKey, { allowExpired: true });
-    if (stale?.length) {
-      console.warn(`${LOG_PREFIX} starred scrape empty; reusing stale list (${stale.length})`);
-      return stale;
-    }
-    return [];
-  }
-
-  function parseTimestamp(value) {
-    if (value == null || value === '') return 0;
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
-    const raw = compact(value);
-    if (!raw) return 0;
-    const ms = Date.parse(raw);
-    if (Number.isFinite(ms)) return ms;
-    // Safari is pickier about some date forms; normalize "YYYY-MM-DD HH:mm:ss"
-    const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
-    const ms2 = Date.parse(normalized.endsWith('Z') || /[+-]\d{2}:?\d{2}$/.test(normalized)
-      ? normalized
-      : `${normalized}Z`);
-    return Number.isFinite(ms2) ? ms2 : 0;
-  }
-
-  function mapAtomEntry(entry, repo) {
-    const title = atomText(entry, 'title');
-    const link = atomLinkHref(entry);
-    // Prefer entry-level updated/published. Fall back to <id> date fragment if needed.
-    const updatedRaw = atomText(entry, 'updated') || atomText(entry, 'published');
-    const idText = atomText(entry, 'id');
-    const authorNode = atomElement(entry, 'author');
-    const author = (authorNode ? atomText(authorNode, 'name') : '') || repo.owner;
-    const bodyRaw = atomContentHtml(entry);
-
-    const tagMatch = link.match(/\/releases\/tag\/(.+)$/);
-    const tagName = tagMatch ? decodeURIComponent(tagMatch[1]) : title;
-    let createdAtMs = parseTimestamp(updatedRaw);
-    if (!createdAtMs && idText) {
-      // tag:github.com,2008:Repository/123/v1.0 is not a date; skip.
-      // Some feeds embed ISO timestamps in id — try a loose match.
-      const iso = idText.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/);
-      if (iso) createdAtMs = parseTimestamp(iso[0]);
-    }
-
-    if (!tagName && !createdAtMs) return null;
-
-    const createdAt = updatedRaw || (createdAtMs ? new Date(createdAtMs).toISOString() : '');
 
     return {
-      id: `release-${repo.name}-${tagName || createdAtMs || title}`,
+      pages: page,
+      repos: uniqueBy(repos, (repo) => repo.name),
+    };
+  }
+
+  async function fetchStarredRepos(userName, { force = false } = {}) {
+    // Cursor pagination — GitHub stars no longer supports ?page=N
+    if (!force) {
+      const cached = cacheGet(STARS_CACHE_KEY);
+      if (cached?.length) return cached;
+    }
+
+    // One-time drop of legacy page-based cache
+    if (!legacyStarsCacheCleared) {
+      legacyStarsCacheCleared = true;
+      try {
+        localStorage.removeItem(CACHE_PREFIX + 'starred-repos');
+      } catch (error) {
+        // ignore
+      }
+    }
+
+    const previous = cacheGetEntry(STARS_CACHE_KEY)?.data || [];
+    const needFull = force || !previous.length;
+    const scraped = await scrapeStarredRepoPages(userName, {
+      maxPages: needFull ? HTML_FULL_STARS_MAX_PAGES : HTML_HOT_STAR_PAGES,
+    });
+
+    const uniqueRepos = needFull
+      ? scraped.repos
+      : uniqueBy([...scraped.repos, ...previous], (repo) => repo.name);
+
+    console.debug(`${LOG_PREFIX} fetched starred repos`, {
+      pages: scraped.pages,
+      count: uniqueRepos.length,
+      mode: needFull ? 'full' : 'hot-merge',
+    });
+    if (uniqueRepos.length) cacheSet(STARS_CACHE_KEY, uniqueRepos, STARS_CACHE_TTL);
+    return uniqueRepos;
+  }
+
+  function parseAtomReleaseEntry(entry, repo) {
+    const title = compact(entry.querySelector('title')?.textContent || '');
+    const link = entry.querySelector('link[rel="alternate"]')?.getAttribute('href')
+      || entry.querySelector('link')?.getAttribute('href')
+      || '';
+    const updated = entry.querySelector('updated')?.textContent || '';
+    const author = compact(entry.querySelector('author name')?.textContent || '') || repo.owner;
+    const tagMatch = link.match(/\/releases\/tag\/(.+)$/);
+    const tagName = tagMatch ? decodeURIComponent(tagMatch[1]) : title;
+    const rawBody = entry.querySelector('content')?.textContent || '';
+
+    return {
+      id: `release-${repo.name}-${tagName}`,
       actor: author,
       actorAvatar: githubAvatarUrl(repo.owner),
-      createdAt,
-      createdAtMs,
+      createdAt: updated,
       href: link || repo.href,
-      tagName: tagName || title || 'release',
+      tagName,
       releaseName: title,
       repoName: repo.name,
       repoOwner: repo.owner,
-      bodyHtml: sanitizeReleaseHtml(bodyRaw),
+      // Defer sanitize until a release makes the top feed — DOMParser is expensive at scale.
+      bodyHtml: '',
+      rawBody,
     };
   }
 
-  async function fetchRepoReleases(repo, { force = false } = {}) {
+  function withSanitizedBody(item) {
+    if (!item) return item;
+    if (item.bodyHtml) return item;
+    if (!item.rawBody) return { ...item, bodyHtml: '' };
+    return {
+      ...item,
+      bodyHtml: sanitizeReleaseHtml(item.rawBody),
+      rawBody: '',
+    };
+  }
+
+  function latestReleaseAgeMs(releases) {
+    if (!Array.isArray(releases) || !releases.length) return null;
+    let newest = 0;
+    for (const item of releases) {
+      const ts = new Date(item?.createdAt || 0).getTime();
+      if (!Number.isNaN(ts) && ts > newest) newest = ts;
+    }
+    return newest ? Date.now() - newest : null;
+  }
+
+  function releaseCacheTtl(releases) {
+    if (!releases?.length) return EMPTY_RELEASES_CACHE_TTL;
+    const age = latestReleaseAgeMs(releases);
+    if (age == null || age > ACTIVE_MS) return STALE_RELEASES_CACHE_TTL;
+    return RELEASES_CACHE_TTL;
+  }
+
+  async function fetchRepoReleases(repo) {
     const cacheKey = `releases-${repo.name}`;
-    const cachedEntry = cacheRead(cacheKey);
-    const cachedItems = Array.isArray(cachedEntry?.data) ? cachedEntry.data : null;
+    const entry = cacheGetEntry(cacheKey);
 
-    if (!force && cachedEntry && !cachedEntry.expired && cachedItems) {
-      // Empty arrays are NEVER treated as fresh — they are usually parse failures,
-      // rate-limit HTML, or a transient GitHub glitch. Always revalidate.
-      const empty = cachedItems.length === 0;
-      const softStale = empty || cachedEntry.age > RELEASES_SOFT_TTL;
-      if (!empty) {
-        return {
-          items: cachedItems,
-          fromCache: true,
-          softStale,
-          age: cachedEntry.age,
-        };
+    if (entry && !entry.expired && entry.data) return entry.data;
+
+    // Stale cache: empty feeds or known-old releases are extended, not refetched.
+    if (Array.isArray(entry?.data)) {
+      if (!entry.data.length) {
+        cacheSet(cacheKey, [], EMPTY_RELEASES_CACHE_TTL);
+        return entry.data;
       }
-      // fall through to network for empty cache even if hard TTL remains
-    }
-
-    if (!force && cachedEntry?.expired) {
-      cacheRemove(cacheKey);
-    }
-
-    const url = `https://github.com/${repo.name}/releases.atom`;
-    let response;
-    try {
-      response = await fetchGithub(url, {
-        headers: { Accept: 'application/atom+xml, application/xml, text/xml, */*;q=0.1' },
-      });
-    } catch (error) {
-      console.warn(`${LOG_PREFIX} release fetch failed`, repo.name, error);
-      if (cachedItems?.length) {
-        return { items: cachedItems, fromCache: true, softStale: true, error: true };
+      const age = latestReleaseAgeMs(entry.data);
+      if (age != null && age > ACTIVE_MS) {
+        cacheSet(cacheKey, entry.data, STALE_RELEASES_CACHE_TTL);
+        return entry.data;
       }
-      return { items: [], fromCache: false, softStale: false, error: true };
     }
 
-    if (response.status === 404) {
-      // Repo truly has no releases feed.
-      cacheSet(cacheKey, [], RELEASES_CACHE_TTL);
-      return { items: [], fromCache: false, softStale: false };
-    }
-
+    const response = await fetch(`https://github.com/${repo.name}/releases.atom`, {
+      credentials: 'same-origin',
+    });
     if (!response.ok) {
-      // 429 / 5xx / auth glitches: short retry window, keep stale data if any.
-      console.warn(`${LOG_PREFIX} release HTTP ${response.status}`, repo.name);
-      if (cachedItems?.length) {
-        cacheSet(cacheKey, cachedItems, RELEASES_ERROR_TTL);
-        return { items: cachedItems, fromCache: true, softStale: true, error: true };
-      }
-      cacheSet(cacheKey, [], RELEASES_ERROR_TTL);
-      return { items: [], fromCache: false, softStale: false, error: true };
+      cacheSet(cacheKey, [], EMPTY_RELEASES_CACHE_TTL);
+      return [];
     }
 
     const xml = await response.text();
-    if (!xml || !xml.includes('<')) {
-      cacheSet(cacheKey, cachedItems || [], RELEASES_ERROR_TTL);
-      return {
-        items: cachedItems || [],
-        fromCache: Boolean(cachedItems?.length),
-        softStale: true,
-        error: true,
-      };
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    if (doc.querySelector('parsererror')) {
+      cacheSet(cacheKey, [], EMPTY_RELEASES_CACHE_TTL);
+      return [];
     }
 
-    // Guard against GitHub HTML error pages being parsed as empty feeds.
-    const looksLikeAtom = /<feed[\s>]/i.test(xml) || /<entry[\s>]/i.test(xml);
-    const { entries } = parseAtomDocument(xml);
-    const releases = entries
-      .slice(0, RELEASES_PER_REPO)
-      .map((entry) => mapAtomEntry(entry, repo))
-      .filter(Boolean)
-      // Ensure every card has a numeric timestamp for stable sorting.
-      .map((item) => ({
-        ...item,
-        createdAtMs: item.createdAtMs || parseTimestamp(item.createdAt),
-      }));
-
-    if (!releases.length) {
-      if (!looksLikeAtom) {
-        console.warn(`${LOG_PREFIX} non-atom body for`, repo.name, xml.slice(0, 120));
-        if (cachedItems?.length) {
-          return { items: cachedItems, fromCache: true, softStale: true, error: true };
-        }
-        cacheSet(cacheKey, [], RELEASES_ERROR_TTL);
-        return { items: [], fromCache: false, softStale: false, error: true };
-      }
-      // Genuine empty feed (repo has no releases).
-      cacheSet(cacheKey, [], RELEASES_CACHE_TTL);
-      return { items: [], fromCache: false, softStale: false };
-    }
-
-    cacheSet(cacheKey, releases, RELEASES_CACHE_TTL);
-    return { items: releases, fromCache: false, softStale: false };
+    const atomEntry = doc.querySelector('entry');
+    const releases = atomEntry ? [parseAtomReleaseEntry(atomEntry, repo)] : [];
+    // Cache metadata only — rawBody is large and only needed for this pass's sanitize.
+    const metaOnly = releases.map(({ rawBody, ...meta }) => meta);
+    cacheSet(cacheKey, metaOnly, releaseCacheTtl(metaOnly));
+    return releases;
   }
 
-  async function fetchAllWithConcurrency(items, fetchFn, concurrency = 5) {
-    const results = [];
-    let index = 0;
+  // ── GraphQL (optional PAT) + HTML fallback ─────────────────────────────
+  //
+  // GitHub’s same-origin endpoint (github.com/_graphql) only accepts the
+  // site’s own persisted query ids. Freeform session GraphQL is rejected with
+  // "No query with given identifier known", so we do NOT attempt it.
+  // Fast path: api.github.com/graphql with a user PAT (two-phase).
+  // Fallback: scrape stars pages + releases.atom.
 
-    async function worker() {
-      while (index < items.length) {
-        const current = index++;
-        try {
-          results[current] = await fetchFn(items[current]);
-        } catch (error) {
-          results[current] = { items: [], fromCache: false, softStale: false, error: true };
-        }
-      }
-    }
-
-    const workers = Array.from(
-      { length: Math.min(concurrency, items.length) },
-      () => worker()
-    );
-    await Promise.all(workers);
-    return results;
-  }
-
-  function releaseSortKey(item) {
-    if (!item) return 0;
-    if (Number.isFinite(item.createdAtMs) && item.createdAtMs > 0) return item.createdAtMs;
-    return parseTimestamp(item.createdAt);
-  }
-
-  function assembleReleaseItems(releaseLists) {
-    return releaseLists
-      .flat()
-      .filter((item) => item && (item.createdAt || item.createdAtMs || item.tagName))
-      .map((item) => ({
-        ...item,
-        createdAtMs: releaseSortKey(item),
-        createdAt: item.createdAt || (item.createdAtMs ? new Date(item.createdAtMs).toISOString() : ''),
-      }))
-      // Newest first. Tie-break by repo/tag so the order is deterministic.
-      .sort((a, b) => {
-        const diff = (b.createdAtMs || 0) - (a.createdAtMs || 0);
-        if (diff !== 0) return diff;
-        return String(a.repoName || '').localeCompare(String(b.repoName || ''))
-          || String(b.tagName || '').localeCompare(String(a.tagName || ''));
-      })
-      .slice(0, RELEASE_FEED_LIMIT);
-  }
-
-  async function loadStarredReleases(data, { force = false, onPartial } = {}) {
-    // Re-capture feed seeds if we still can (feed not yet removed / turbo revisit).
-    if (!feedReleaseSeeds.length || force) {
-      try { captureNativeFeedSnapshot(); } catch (error) { /* ignore */ }
-    }
-
-    // force also re-scrapes the stars list — otherwise STARS_MAX_PAGES changes
-    // and newly-starred / older-starred repos stay invisible for up to 6h.
-    const starredRepos = await fetchStarredRepos(data.userName, { force });
-
-    // Priority: native-feed release repos first, then starred list.
-    // This is what makes cards like YonQua/warp-socks appear even when the
-    // stars scrape misses them or orders them poorly.
-    const candidateRepos = mergeRepoLists(feedReleaseSeeds, starredRepos, data.repos || []);
-    if (!candidateRepos.length) {
-      // Still surface feed hints alone if we have them.
-      const hintOnly = assembleReleaseItems([feedReleaseHints]);
-      return {
-        status: hintOnly.length ? 'ready' : 'empty',
-        items: hintOnly,
-        revalidated: true,
-      };
-    }
-
-    // Pass 1: prefer localStorage. When force=true, skip cache and hit network.
-    // Feed-seeded repos always revalidate first (they're the "new right now" set).
-    const seedNames = new Set(feedReleaseSeeds.map((repo) => repo.name));
-    const firstPass = await fetchAllWithConcurrency(
-      candidateRepos,
-      (repo) => fetchRepoReleases(repo, {
-        force: force || seedNames.has(repo.name),
-      }),
-      6
-    );
-
-    let networkHits = firstPass.filter((result) => result && !result.fromCache && !result.error).length;
-    const softStaleRepos = force
-      ? []
-      : candidateRepos.filter((_, index) => firstPass[index]?.softStale && !seedNames.has(candidateRepos[index].name));
-    let releaseLists = firstPass.map((result) => (result?.items ? result.items : []));
-    // Merge native-feed hint cards so a release is visible even before atom returns.
-    releaseLists = releaseLists.concat([feedReleaseHints]);
-    let items = assembleReleaseItems(releaseLists);
-
-    // Paint cached/hint cards ASAP, then revalidate soft-stale repos.
-    if (typeof onPartial === 'function' && items.length) {
-      try {
-        onPartial({ status: 'ready', items, partial: true });
-      } catch (error) {
-        // ignore partial render failures
-      }
-    }
-
-    // Pass 2: revalidate soft-stale caches only (force/seeds already networked).
-    const needsRefresh = softStaleRepos;
-
-    if (needsRefresh.length) {
-      const refreshed = await fetchAllWithConcurrency(
-        needsRefresh,
-        (repo) => fetchRepoReleases(repo, { force: true }),
-        4
-      );
-      const refreshMap = new Map(needsRefresh.map((repo, i) => [repo.name, refreshed[i]]));
-      releaseLists = candidateRepos.map((repo, index) => {
-        const updated = refreshMap.get(repo.name);
-        if (updated) {
-          if (!updated.error && !updated.fromCache) networkHits += 1;
-          // Keep previous cards if a forced refresh failed transiently.
-          if (updated.error && !(updated.items && updated.items.length)) {
-            return firstPass[index]?.items || [];
+  // Phase 1: find active repos (pushedAt within ACTIVE_REPO_DAYS). No nested releases —
+  // that keeps the stars scan light, then we only query releases for active repos.
+  const STARRED_REPOS_ACTIVITY_QUERY = `
+    query StarredReposActivity($first: Int!, $after: String) {
+      viewer {
+        starredRepositories(
+          first: $first
+          after: $after
+          orderBy: { field: STARRED_AT, direction: DESC }
+        ) {
+          pageInfo {
+            hasNextPage
+            endCursor
           }
-          return updated.items || [];
+          nodes {
+            nameWithOwner
+            owner {
+              login
+              avatarUrl
+            }
+            pushedAt
+          }
         }
-        return firstPass[index]?.items || [];
-      });
-      releaseLists = releaseLists.concat([feedReleaseHints]);
-      items = assembleReleaseItems(releaseLists);
+      }
+    }
+  `;
+
+  // Phase 2: hydrate release notes only for the top feed items.
+  const RELEASE_BODIES_QUERY = `
+    query ReleaseBodies($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        ... on Release {
+          id
+          descriptionHTML
+        }
+      }
+    }
+  `;
+
+  async function githubGraphql(query, variables = {}) {
+    const token = getGithubToken();
+    if (!token) {
+      const err = new Error('missing token');
+      err.code = 'MISSING_TOKEN';
+      throw err;
     }
 
-    // Dedupe by repo@tag after merge (atom + feed hint may both contribute).
-    const deduped = [];
-    const seenCard = new Set();
-    for (const item of items) {
-      const key = `${item.repoName}@${item.tagName}`;
-      if (seenCard.has(key)) continue;
-      seenCard.add(key);
-      deduped.push(item);
+    const response = await fetch(GRAPHQL_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      const err = new Error('graphql non-json response');
+      err.status = response.status;
+      throw err;
     }
-    items = deduped.slice(0, RELEASE_FEED_LIMIT);
 
-    const top = items.slice(0, 8).map((item) => ({
-      repo: item.repoName,
-      tag: item.tagName,
-      at: item.createdAt,
-      ms: item.createdAtMs,
-      source: item.source || 'atom',
-    }));
+    if (response.status === 401 || response.status === 403) {
+      const err = new Error('token rejected');
+      err.code = 'TOKEN_INVALID';
+      err.status = response.status;
+      throw err;
+    }
 
-    const hasWarpSocks = candidateRepos.some((repo) => /warp-socks/i.test(repo.name));
-    console.info(`${LOG_PREFIX} releases loaded`, {
-      repos: candidateRepos.length,
-      starred: starredRepos.length,
-      feedSeeds: feedReleaseSeeds.length,
-      feedHints: feedReleaseHints.length,
-      items: items.length,
-      networkHits,
-      softStale: softStaleRepos.length,
-      refreshed: needsRefresh.length,
-      force,
-      hasWarpSocks,
-      seedSample: feedReleaseSeeds.slice(0, 8).map((repo) => repo.name),
-      top,
+    if (!response.ok) {
+      const err = new Error(`graphql http ${response.status}`);
+      err.status = response.status;
+      throw err;
+    }
+
+    if (payload?.errors?.length) {
+      // Partial success is common with nodes(ids:...); keep data when present.
+      const fatal = !payload.data;
+      const message = payload.errors.map((e) => e.message).join('; ');
+      if (fatal) {
+        const err = new Error(message || 'graphql error');
+        if (/bad credentials|requires authentication|resource not accessible|401|403/i.test(message)) {
+          err.code = 'TOKEN_INVALID';
+        }
+        throw err;
+      }
+      console.debug(`${LOG_PREFIX} GraphQL partial errors`, message);
+    }
+
+    return payload.data;
+  }
+
+  function releaseFromGraphqlNode(repoMeta, releaseNode) {
+    const nameWithOwner = repoMeta.nameWithOwner || repoMeta.name || '';
+    const [owner] = nameWithOwner.split('/');
+    // Card avatar = repo owner (matches HTML path). Release authors are often GitHub Apps.
+    const ownerLogin = repoMeta.ownerLogin || repoMeta.owner?.login || owner;
+    const actorAvatar = repoMeta.ownerAvatar || repoMeta.owner?.avatarUrl || githubAvatarUrl(ownerLogin);
+    const createdAt = releaseNode.publishedAt || releaseNode.createdAt || '';
+    const tagName = releaseNode.tagName || releaseNode.name || '';
+
+    return {
+      id: `release-${nameWithOwner}-${tagName}`,
+      nodeId: releaseNode.id || '',
+      actor: releaseNode.author?.login || ownerLogin,
+      actorAvatar,
+      createdAt,
+      href: releaseNode.url || `https://github.com/${nameWithOwner}`,
+      tagName,
+      releaseName: releaseNode.name || tagName,
+      repoName: nameWithOwner,
+      repoOwner: ownerLogin,
+      bodyHtml: '',
+    };
+  }
+
+  function rankReleaseItems(items) {
+    return items
+      .filter((item) => item && isWithinActiveWindow(item.createdAt))
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+      .slice(0, FEED_LIMIT);
+  }
+
+  function buildActiveReposReleaseQuery(batch) {
+    // Dynamic aliases: r0: repository(owner:"..", name:"..") { releases(first:1) {...} }
+    const fragments = batch.map((repo, index) => {
+      const owner = JSON.stringify(repo.owner);
+      const name = JSON.stringify(repo.repo);
+      return `
+        r${index}: repository(owner: ${owner}, name: ${name}) {
+          nameWithOwner
+          releases(first: 1, orderBy: { field: CREATED_AT, direction: DESC }) {
+            nodes {
+              id
+              name
+              tagName
+              publishedAt
+              createdAt
+              url
+              author { login }
+            }
+          }
+        }`;
+    });
+    return `query ActiveRepoReleases {\n${fragments.join('\n')}\n}`;
+  }
+
+  function mapReleaseBatch(batch, data) {
+    const items = [];
+    batch.forEach((repo, index) => {
+      const node = data?.[`r${index}`];
+      const release = node?.releases?.nodes?.[0];
+      if (!release) return;
+      items.push(releaseFromGraphqlNode({
+        nameWithOwner: node.nameWithOwner || repo.name,
+        ownerLogin: repo.owner,
+        ownerAvatar: repo.avatar,
+      }, release));
+    });
+    return items;
+  }
+
+  // Global release-batch queue so pipelined scan pages share one concurrency cap.
+  const releaseBatchQueue = [];
+  let releaseBatchActive = 0;
+
+  function enqueueReleaseBatch(batch) {
+    return new Promise((resolve) => {
+      releaseBatchQueue.push({ batch, resolve });
+      pumpReleaseBatchQueue();
+    });
+  }
+
+  function pumpReleaseBatchQueue() {
+    while (releaseBatchActive < GRAPHQL_RELEASE_CONCURRENCY && releaseBatchQueue.length) {
+      const { batch, resolve } = releaseBatchQueue.shift();
+      releaseBatchActive++;
+      githubGraphql(buildActiveReposReleaseQuery(batch), {})
+        .then((data) => resolve(mapReleaseBatch(batch, data)))
+        .catch((error) => {
+          console.warn(`${LOG_PREFIX} active-repo release batch failed`, error);
+          resolve([]);
+        })
+        .finally(() => {
+          releaseBatchActive--;
+          pumpReleaseBatchQueue();
+        });
+    }
+  }
+
+  async function fetchReleasesForActiveRepos(activeRepos) {
+    if (!activeRepos.length) return [];
+    const batches = [];
+    for (let i = 0; i < activeRepos.length; i += GRAPHQL_RELEASE_BATCH) {
+      batches.push(activeRepos.slice(i, i + GRAPHQL_RELEASE_BATCH));
+    }
+    const lists = await Promise.all(batches.map((batch) => enqueueReleaseBatch(batch)));
+    return lists.flat().filter(Boolean);
+  }
+
+  async function hydrateReleaseBodies(items) {
+    const pending = items.filter((item) => item.nodeId && !item.bodyHtml);
+    if (!pending.length) return items;
+
+    const bodyByNodeId = new Map();
+    const batches = [];
+    for (let i = 0; i < pending.length; i += GRAPHQL_BODY_BATCH) {
+      batches.push(pending.slice(i, i + GRAPHQL_BODY_BATCH));
+    }
+
+    await mapPool(batches, async (batch) => {
+      try {
+        const data = await githubGraphql(RELEASE_BODIES_QUERY, {
+          ids: batch.map((item) => item.nodeId),
+        });
+        for (const node of data?.nodes || []) {
+          if (node?.id) bodyByNodeId.set(node.id, node.descriptionHTML || '');
+        }
+      } catch (error) {
+        console.warn(`${LOG_PREFIX} failed to hydrate release bodies`, error);
+      }
+    }, GRAPHQL_BODY_CONCURRENCY);
+
+    return items.map((item) => {
+      if (!item.nodeId || !bodyByNodeId.has(item.nodeId)) return item;
+      return {
+        ...item,
+        bodyHtml: sanitizeReleaseHtml(bodyByNodeId.get(item.nodeId) || ''),
+      };
+    });
+  }
+
+  async function finalizeGraphqlFeed(releaseItems, stats) {
+    const tBody = performance.now();
+    const sorted = await hydrateReleaseBodies(rankReleaseItems(releaseItems));
+    const bodyMs = Math.round(performance.now() - tBody);
+
+    console.debug(`${LOG_PREFIX} GraphQL feed ready`, {
+      ...stats,
+      activeDays: ACTIVE_REPO_DAYS,
+      releases: sorted.length,
+      bodyMs,
+      totalMs: Math.round(performance.now() - stats.t0),
     });
 
     return {
-      status: items.length ? 'ready' : 'empty',
-      items,
-      revalidated: true,
+      status: sorted.length ? 'ready' : 'empty',
+      items: sorted,
+      source: 'graphql',
+      repoCount: stats.scanned,
+      activeRepoCount: stats.activeRepos,
     };
+  }
+
+  // Single final paint only.
+  // Pipeline: as each activity page returns, enqueue release batches so they
+  // overlap later scan pages. Cursor pages stay serial; release queue is global.
+  async function fetchGraphQLStarredReleases() {
+    const t0 = performance.now();
+
+    // Hot path: reuse cached active list (skip ~10s scan)
+    const cached = cacheGet(GRAPHQL_ACTIVE_CACHE_KEY);
+    if (cached?.activeRepos && Array.isArray(cached.activeRepos)) {
+      const activeRepos = cached.activeRepos;
+      const t1 = performance.now();
+      const releaseItems = await fetchReleasesForActiveRepos(activeRepos);
+      return finalizeGraphqlFeed(releaseItems, {
+        t0,
+        pages: cached.pages || 0,
+        scanned: cached.scanned || activeRepos.length,
+        activeRepos: activeRepos.length,
+        scanFromCache: true,
+        pageMs: [],
+        scanMs: 0,
+        releaseMs: Math.round(performance.now() - t1),
+        releaseWaitMs: 0,
+        pipelineMs: Math.round(performance.now() - t1),
+      });
+    }
+
+    const activeRepos = [];
+    const seenRepo = new Set();
+    const releasePromises = [];
+    let after = null;
+    let page = 0;
+    let scanned = 0;
+    const pageMs = [];
+
+    while (page < GRAPHQL_MAX_PAGES) {
+      page++;
+      const pageStart = performance.now();
+      const data = await githubGraphql(STARRED_REPOS_ACTIVITY_QUERY, {
+        first: GRAPHQL_PAGE_SIZE,
+        after,
+      });
+      pageMs.push(Math.round(performance.now() - pageStart));
+
+      const connection = data?.viewer?.starredRepositories;
+      if (!connection) break;
+
+      const pageActive = [];
+      for (const node of connection.nodes || []) {
+        if (!node?.nameWithOwner || seenRepo.has(node.nameWithOwner)) continue;
+        seenRepo.add(node.nameWithOwner);
+        scanned++;
+        if (!isWithinActiveWindow(node.pushedAt)) continue;
+
+        const [owner, repo] = node.nameWithOwner.split('/');
+        const row = {
+          name: node.nameWithOwner,
+          owner,
+          repo,
+          avatar: node.owner?.avatarUrl || githubAvatarUrl(owner),
+          pushedAt: node.pushedAt,
+          href: `https://github.com/${node.nameWithOwner}`,
+        };
+        activeRepos.push(row);
+        pageActive.push(row);
+      }
+
+      // Overlap: fetch this page's active releases while later scan pages load
+      if (pageActive.length) {
+        releasePromises.push(fetchReleasesForActiveRepos(pageActive));
+      }
+
+      if (!connection.pageInfo?.hasNextPage || !connection.pageInfo?.endCursor) break;
+      after = connection.pageInfo.endCursor;
+    }
+
+    const scanMs = Math.round(performance.now() - t0);
+
+    activeRepos.sort((a, b) => new Date(b.pushedAt || 0) - new Date(a.pushedAt || 0));
+    cacheSet(GRAPHQL_ACTIVE_CACHE_KEY, {
+      activeRepos,
+      scanned,
+      pages: page,
+      activeDays: ACTIVE_REPO_DAYS,
+    }, GRAPHQL_ACTIVE_CACHE_TTL);
+
+    const tWait = performance.now();
+    const releaseLists = await Promise.all(releasePromises);
+    const releaseWaitMs = Math.round(performance.now() - tWait);
+    const releaseItems = releaseLists.flat().filter(Boolean);
+
+    return finalizeGraphqlFeed(releaseItems, {
+      t0,
+      pages: page,
+      scanned,
+      activeRepos: activeRepos.length,
+      scanFromCache: false,
+      pageMs,
+      scanMs,
+      releaseWaitMs,
+      pipelineMs: scanMs + releaseWaitMs,
+    });
+  }
+
+  function stripRawBody(item) {
+    if (!item) return item;
+    const { rawBody, ...rest } = item;
+    return rest;
+  }
+
+  async function fetchHtmlStarredReleases(userName, { force = false } = {}) {
+    const t0 = performance.now();
+    const starredRepos = await fetchStarredRepos(userName, { force });
+    if (!starredRepos.length) {
+      return { status: 'empty', items: [], source: 'html', repoCount: 0 };
+    }
+
+    // Latest release meta per repo. Known-old/empty caches are skipped inside fetchRepoReleases.
+    const allReleases = await mapPool(starredRepos, fetchRepoReleases, HTML_ATOM_CONCURRENCY);
+
+    let ranked = allReleases
+      .flat()
+      .filter((item) => item && isWithinActiveWindow(item.createdAt))
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+      .slice(0, FEED_LIMIT)
+      .map(withSanitizedBody);
+
+    // Cache hits have no rawBody — re-fetch only top cards that still need notes
+    const missingBodyRepos = uniqueBy(
+      ranked
+        .filter((item) => !item.bodyHtml)
+        .map((item) => ({
+          name: item.repoName,
+          owner: item.repoOwner,
+          repo: (item.repoName || '').split('/')[1],
+          href: `https://github.com/${item.repoName}`,
+        })),
+      (repo) => repo.name
+    );
+
+    if (missingBodyRepos.length) {
+      const bodyByRepo = new Map();
+      await mapPool(missingBodyRepos, async (repo) => {
+        try {
+          const response = await fetch(`https://github.com/${repo.name}/releases.atom`, {
+            credentials: 'same-origin',
+          });
+          if (!response.ok) return;
+          const xml = await response.text();
+          const doc = new DOMParser().parseFromString(xml, 'application/xml');
+          if (doc.querySelector('parsererror')) return;
+          const entry = doc.querySelector('entry');
+          if (!entry) return;
+          const clean = stripRawBody(withSanitizedBody(parseAtomReleaseEntry(entry, repo)));
+          bodyByRepo.set(repo.name, clean.bodyHtml || '');
+          cacheSet(`releases-${repo.name}`, [clean], releaseCacheTtl([clean]));
+        } catch (error) {
+          // ignore single-repo body failures
+        }
+      }, HTML_ATOM_CONCURRENCY);
+
+      ranked = ranked.map((item) => (
+        item.bodyHtml ? item : { ...item, bodyHtml: bodyByRepo.get(item.repoName) || '' }
+      ));
+    } else {
+      // Persist sanitized bodies so later visits skip re-sanitize work
+      ranked.forEach((item) => {
+        if (!item?.bodyHtml || !item.repoName) return;
+        cacheSet(`releases-${item.repoName}`, [stripRawBody(item)], releaseCacheTtl([item]));
+      });
+    }
+
+    ranked = ranked.map(stripRawBody);
+
+    console.debug(`${LOG_PREFIX} HTML feed ready`, {
+      repos: starredRepos.length,
+      releases: ranked.length,
+      activeDays: ACTIVE_REPO_DAYS,
+      totalMs: Math.round(performance.now() - t0),
+    });
+
+    return {
+      status: ranked.length ? 'ready' : 'empty',
+      items: ranked,
+      source: 'html',
+      repoCount: starredRepos.length,
+    };
+  }
+
+  async function loadStarredReleases(data, { force = false } = {}) {
+    const useGraphql = hasGithubToken();
+
+    // Fresh cache hit only — stale entries are shown by loadReleasesFor, then revalidated here
+    if (!force) {
+      for (const key of [GRAPHQL_CACHE_KEY, HTML_FEED_CACHE_KEY]) {
+        const entry = cacheGetEntry(key);
+        if (entry && !entry.expired && entry.data?.items) {
+          // Prefer GraphQL cache only when token is present; otherwise prefer HTML cache
+          if (key === GRAPHQL_CACHE_KEY && !useGraphql) continue;
+          return {
+            status: entry.data.items.length ? 'ready' : 'empty',
+            items: entry.data.items,
+            source: entry.data.source || (useGraphql ? 'graphql' : 'html'),
+            fromCache: true,
+          };
+        }
+      }
+    }
+
+    let result;
+    if (useGraphql) {
+      try {
+        result = await fetchGraphQLStarredReleases();
+      } catch (error) {
+        console.warn(`${LOG_PREFIX} GraphQL failed, falling back to HTML scrape`, error);
+        result = await fetchHtmlStarredReleases(data.userName, { force });
+        if (error?.code === 'TOKEN_INVALID') result.tokenError = true;
+      }
+    } else {
+      result = await fetchHtmlStarredReleases(data.userName, { force });
+    }
+
+    const storeKey = result.source === 'graphql' ? GRAPHQL_CACHE_KEY : HTML_FEED_CACHE_KEY;
+    const ttl = result.source === 'graphql' ? GRAPHQL_CACHE_TTL : RELEASES_CACHE_TTL;
+    cacheSet(storeKey, {
+      items: result.items,
+      source: result.source,
+      repoCount: result.repoCount,
+    }, ttl);
+
+    return result;
   }
 
   // ── Data collection ───────────────────────────────────────────────────
@@ -1090,51 +1206,132 @@
       users: usersFromRepos(repos, userName, avatar?.src || ''),
       releaseItems: [],
       releaseStatus: 'loading',
-      releaseFetchedAt: 0,
+      feedSource: hasGithubToken() ? 'graphql' : 'html',
+      feedStale: false,
+      statusMessage: '',
       repoCount: repos.length,
-      today: dateDaysAgo(0),
     };
   }
 
   function dataKey(data) {
-    return `${data.userName}|${data.repos.map((repo) => repo.name).join(',')}`;
+    return `${data.userName}|${data.repos.map((repo) => repo.name).join(',')}|${isChineseLocale() ? 'zh' : 'en'}`;
+  }
+
+  function pickFeedCacheEntry() {
+    const useGraphql = hasGithubToken();
+    const order = useGraphql
+      ? [GRAPHQL_CACHE_KEY, HTML_FEED_CACHE_KEY]
+      : [HTML_FEED_CACHE_KEY, GRAPHQL_CACHE_KEY];
+    for (const key of order) {
+      const entry = cacheGetEntry(key);
+      if (entry?.data?.items?.length) return entry;
+    }
+    return null;
+  }
+
+  function applyFeedResult(result) {
+    if (!lastData) return;
+    lastData.releaseItems = result.items || [];
+    lastData.releaseStatus = result.status || 'empty';
+    lastData.feedSource = result.source || (hasGithubToken() ? 'graphql' : 'html');
+    lastData.feedStale = false;
+    if (result.tokenError) {
+      lastData.statusMessage = t('tokenInvalid');
+    } else if (pendingStatusMessage) {
+      lastData.statusMessage = pendingStatusMessage;
+      pendingStatusMessage = '';
+    } else {
+      lastData.statusMessage = '';
+    }
   }
 
   function loadReleasesFor(data, key, { force = false } = {}) {
-    // Allow a forced refresh to interrupt an in-flight soft load for the same key.
     if (!force && releaseLoadKey === key) return;
     releaseLoadKey = key;
     const requestId = ++releaseRequestId;
 
-    const applyResult = (result, { final = false } = {}) => {
-      if (requestId !== releaseRequestId || key !== lastDataKey || !lastData) return;
-      lastData.releaseItems = result.items;
-      lastData.releaseStatus = result.status;
-      if (final) lastData.releaseFetchedAt = Date.now();
+    // SWR: paint cache immediately; revalidate when stale or forced
+    let needsNetwork = force;
+    if (!force) {
+      const entry = pickFeedCacheEntry();
+      if (entry?.data?.items?.length && lastData) {
+        lastData.releaseItems = entry.data.items;
+        lastData.releaseStatus = 'ready';
+        lastData.feedSource = entry.data.source || (hasGithubToken() ? 'graphql' : 'html');
+        lastData.feedStale = entry.expired;
+        lastData.statusMessage = entry.expired ? t('refreshing') : '';
+        renderWorkbench(lastData);
+        if (!entry.expired) {
+          releaseLoadKey = '';
+          return;
+        }
+        needsNetwork = true;
+      } else {
+        needsNetwork = true;
+      }
+    } else if (lastData) {
+      lastData.releaseStatus = lastData.releaseItems?.length ? 'ready' : 'loading';
+      lastData.statusMessage = pendingStatusMessage || t('refreshing');
+      lastData.feedStale = true;
       renderWorkbench(lastData);
-      publishState();
-    };
+    }
 
-    loadStarredReleases(data, {
-      force,
-      onPartial: (partial) => applyResult(partial, { final: false }),
-    })
+    if (!needsNetwork) {
+      releaseLoadKey = '';
+      return;
+    }
+
+    loadStarredReleases(data, { force: true })
       .then((result) => {
-        applyResult(result, { final: true });
-        if (requestId === releaseRequestId) releaseLoadKey = '';
+        if (requestId !== releaseRequestId || key !== lastDataKey || !lastData) return;
+        applyFeedResult(result);
+        releaseLoadKey = '';
+        renderWorkbench(lastData);
       })
       .catch((error) => {
         console.warn(`${LOG_PREFIX} failed to load starred releases`, error);
         if (requestId !== releaseRequestId || key !== lastDataKey || !lastData) return;
-        // Keep previous items on refresh failure so the feed doesn't flash empty.
         if (!lastData.releaseItems?.length) {
           lastData.releaseItems = [];
           lastData.releaseStatus = 'error';
-          renderWorkbench(lastData);
         }
-        lastData.releaseFetchedAt = Date.now();
+        lastData.feedStale = false;
+        lastData.statusMessage = error?.code === 'TOKEN_INVALID' ? t('tokenInvalid') : '';
+        pendingStatusMessage = '';
         releaseLoadKey = '';
+        renderWorkbench(lastData);
       });
+  }
+
+  function forceRefreshFeed() {
+    if (!lastData || !lastDataKey) return;
+    clearFeedCaches();
+    // Keep token; only drop feed/stars/release caches
+    lastData.releaseItems = [];
+    lastData.releaseStatus = 'loading';
+    lastData.statusMessage = pendingStatusMessage || t('refreshing');
+    releaseLoadKey = '';
+    renderWorkbench(lastData);
+    loadReleasesFor(lastData, lastDataKey, { force: true });
+  }
+
+  function saveTokenFromInput() {
+    const input = document.getElementById('ghg-token-input');
+    const value = compact(input?.value || '');
+    if (!value) return;
+    setGithubToken(value);
+    settingsOpen = false;
+    pendingStatusMessage = t('tokenSaved');
+    if (lastData) lastData.feedSource = 'graphql';
+    forceRefreshFeed();
+  }
+
+  function clearTokenAndRefresh() {
+    setGithubToken('');
+    settingsOpen = false;
+    pendingStatusMessage = t('tokenCleared');
+    if (lastData) lastData.feedSource = 'html';
+    forceRefreshFeed();
   }
 
   // ── Templates ─────────────────────────────────────────────────────────
@@ -1151,12 +1348,15 @@
   function releaseCardTemplate(item) {
     const repoUrl = `https://github.com/${escapeHtml(item.repoName)}`;
     const hasBody = item.bodyHtml && item.bodyHtml.trim().length > 0;
+    const ownerKey = item.repoOwner || (item.repoName || '').split('/')[0];
+    const avatarFallback = githubAvatarUrl(ownerKey);
+    const avatar = item.actorAvatar || avatarFallback;
 
     return `
       <article class="ghg-rc">
         <div class="ghg-rc-header">
           <a class="ghg-rc-avatar-wrap" href="${escapeHtml(repoUrl)}">
-            <img class="ghg-rc-avatar" src="${escapeHtml(item.actorAvatar)}" alt="">
+            <img class="ghg-rc-avatar" src="${escapeHtml(avatar)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='${escapeHtml(avatarFallback)}'">
             <span class="ghg-rc-badge">${iconTag()}</span>
           </a>
           <div class="ghg-rc-meta">
@@ -1208,6 +1408,65 @@
     return items.map(releaseCardTemplate).join('');
   }
 
+  function settingsPanelTemplate() {
+    const token = getGithubToken();
+    const masked = token
+      ? `${token.slice(0, 7)}…${token.slice(-4)}`
+      : '';
+
+    return `
+      <div class="ghg-settings ${settingsOpen ? 'is-open' : ''}" id="ghg-settings">
+        <div class="ghg-settings-head">
+          <strong>${escapeHtml(t('apiToken'))}</strong>
+          <a href="${escapeHtml(TOKEN_CREATE_URL)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('createToken'))}</a>
+        </div>
+        <p class="ghg-settings-hint">${escapeHtml(t('apiTokenHint'))}</p>
+        <p class="ghg-settings-scopes">${escapeHtml(t('apiTokenScopes'))}</p>
+        <div class="ghg-settings-row">
+          <input
+            id="ghg-token-input"
+            class="ghg-token-input"
+            type="password"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="${escapeHtml(token ? masked : t('tokenPlaceholder'))}"
+          />
+        </div>
+        <div class="ghg-settings-actions">
+          <button type="button" class="ghg-btn ghg-btn-primary" data-ghg-action="save-token">${escapeHtml(t('saveToken'))}</button>
+          <button type="button" class="ghg-btn" data-ghg-action="clear-token" ${token ? '' : 'disabled'}>${escapeHtml(t('clearToken'))}</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function mainHeadTemplate(data) {
+    const source = data.feedSource || (hasGithubToken() ? 'graphql' : 'html');
+    const isGraphql = source === 'graphql';
+    const sourceLabel = isGraphql ? t('tokenConfigured') : t('tokenMissing');
+    const badgeClass = isGraphql ? 'is-graphql' : 'is-html';
+    const msg = data.statusMessage || (data.feedStale ? t('refreshing') : '');
+
+    return `
+      <div class="ghg-main-head">
+        <div class="ghg-main-head-left">
+          <h1>${escapeHtml(t('releaseRadar'))}</h1>
+          <span class="ghg-source-badge ${badgeClass}" title="${escapeHtml(sourceLabel)}">${escapeHtml(sourceLabel)}</span>
+          ${msg ? `<span class="ghg-status-msg">${escapeHtml(msg)}</span>` : ''}
+        </div>
+        <div class="ghg-main-actions">
+          <button type="button" class="ghg-icon-btn" data-ghg-action="refresh" title="${escapeHtml(t('refreshFeed'))}" aria-label="${escapeHtml(t('refreshFeed'))}">
+            ${iconRefresh()}
+          </button>
+          <button type="button" class="ghg-icon-btn ${settingsOpen ? 'is-active' : ''}" data-ghg-action="toggle-settings" title="${escapeHtml(t('settings'))}" aria-label="${escapeHtml(t('settings'))}" aria-expanded="${settingsOpen ? 'true' : 'false'}">
+            ${iconGear()}
+          </button>
+        </div>
+      </div>
+      ${settingsPanelTemplate()}
+    `;
+  }
+
   function leftMenuTemplate(data) {
     return `
       <section>
@@ -1237,52 +1496,36 @@
 
   // ── Render ────────────────────────────────────────────────────────────
 
-  function bindWorkbenchEvents(root) {
-    const refreshBtn = root.querySelector('[data-ghg-refresh]');
-    if (!refreshBtn || refreshBtn.dataset.bound === '1') return;
-    refreshBtn.dataset.bound = '1';
-    refreshBtn.addEventListener('click', (event) => {
-      event.preventDefault();
-      refreshBtn.disabled = true;
-      refreshBtn.textContent = t('refreshing');
-      hardRefreshReleases().finally(() => {
-        // renderWorkbench will rebuild the button; keep a fallback if still mounted.
-        if (refreshBtn.isConnected) {
-          refreshBtn.disabled = false;
-          refreshBtn.textContent = t('refresh');
-        }
-      });
-    });
+  function ensureStyles() {
+    if (stylesInjected && document.getElementById(STYLE_ID)) return;
+    let styleEl = document.getElementById(STYLE_ID);
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = STYLE_ID;
+      document.documentElement.appendChild(styleEl);
+    }
+    styleEl.textContent = styles();
+    stylesInjected = true;
   }
 
   function renderWorkbench(data) {
+    ensureStyles();
+
     let root = document.getElementById(ROOT_ID);
     if (!root) {
       root = document.createElement('div');
       root.id = ROOT_ID;
-      root.dataset.ghgVersion = SCRIPT_VERSION;
       findInsertionPoint().before(root);
     }
 
-    const isRefreshing = data.releaseStatus === 'loading' && Boolean(data.releaseItems?.length);
-    root.dataset.ghgVersion = SCRIPT_VERSION;
     root.innerHTML = `
-      <style>${styles()}</style>
       <div class="ghg-shell">
         <aside class="ghg-left" aria-label="${escapeHtml(t('myWorkspace'))}">
           ${leftMenuTemplate(data)}
         </aside>
 
         <main class="ghg-main" aria-label="${escapeHtml(t('releaseRadar'))}">
-          <div class="ghg-main-head">
-            <h1>${escapeHtml(t('releaseRadar'))}</h1>
-            <div class="ghg-main-actions">
-              <span class="ghg-version" title="GitHub Home Enhancer">v${escapeHtml(SCRIPT_VERSION)}</span>
-              <button type="button" class="ghg-refresh-btn" data-ghg-refresh ${isRefreshing ? 'disabled' : ''}>
-                ${escapeHtml(isRefreshing ? t('refreshing') : t('refresh'))}
-              </button>
-            </div>
-          </div>
+          ${mainHeadTemplate(data)}
           <div class="ghg-release-feed">
             ${releaseFeedTemplate(data)}
           </div>
@@ -1297,7 +1540,7 @@
             ${data.users.map((user) => `
               <div class="ghg-follow">
                 <a class="ghg-follow-avatar" href="${escapeHtml(user.href)}">
-                  ${user.avatar ? `<img src="${escapeHtml(user.avatar)}" alt="">` : `<img src="${escapeHtml(githubAvatarUrl(user.name))}" alt="">`}
+                  <img src="${escapeHtml(user.avatar || githubAvatarUrl(user.name))}" alt="">
                 </a>
                 <span>
                   <a class="ghg-user-link" href="${escapeHtml(user.href)}">${escapeHtml(user.name)}</a>
@@ -1337,15 +1580,48 @@
       </div>
     `;
 
-    bindWorkbenchEvents(root);
     document.body.classList.add(ACTIVE_CLASS);
-    markVersionOnDom();
-    publishState();
+    bindWorkbenchEvents();
     console.debug(`${LOG_PREFIX} rendered`, {
-      version: SCRIPT_VERSION,
       path: location.pathname,
       releases: (data.releaseItems || []).length,
-      status: data.releaseStatus,
+      source: data.feedSource,
+    });
+  }
+
+  function bindWorkbenchEvents() {
+    if (eventsBound) return;
+    eventsBound = true;
+
+    document.addEventListener('click', (event) => {
+      const actionEl = event.target.closest?.('[data-ghg-action]');
+      if (!actionEl || !document.getElementById(ROOT_ID)?.contains(actionEl)) return;
+
+      const action = actionEl.getAttribute('data-ghg-action');
+      if (action === 'toggle-settings') {
+        settingsOpen = !settingsOpen;
+        if (lastData) renderWorkbench(lastData);
+        return;
+      }
+      if (action === 'refresh') {
+        forceRefreshFeed();
+        return;
+      }
+      if (action === 'save-token') {
+        saveTokenFromInput();
+        return;
+      }
+      if (action === 'clear-token') {
+        clearTokenAndRefresh();
+      }
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      const input = event.target;
+      if (!(input instanceof HTMLInputElement) || input.id !== 'ghg-token-input') return;
+      event.preventDefault();
+      saveTokenFromInput();
     });
   }
 
@@ -1390,12 +1666,33 @@
       /* ── Main column (Release Feed) ────────────────────────────── */
       .ghg-main { padding: 24px 32px 48px; min-width: 0; overflow: hidden; background: #f6f8fa; }
       .ghg-main-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+      .ghg-main-head-left { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
       .ghg-main h1 { margin: 0; color: #1f2328; font-size: 20px; line-height: 28px; font-weight: 600; }
-      .ghg-main-actions { display: inline-flex; align-items: center; gap: 10px; flex-shrink: 0; }
-      .ghg-version { color: #8c959f; font-size: 12px; font-variant-numeric: tabular-nums; }
-      .ghg-refresh-btn { appearance: none; border: 1px solid #d0d7de; background: #ffffff; color: #24292f; border-radius: 6px; padding: 5px 12px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; line-height: 20px; }
-      .ghg-refresh-btn:hover:not(:disabled) { background: #f6f8fa; border-color: #afb8c1; }
-      .ghg-refresh-btn:disabled { opacity: 0.65; cursor: default; }
+      .ghg-main-actions { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+      .ghg-icon-btn { width: 32px; height: 32px; display: inline-grid; place-items: center; border: 1px solid #d0d7de; border-radius: 6px; background: #ffffff; color: #57606a; cursor: pointer; padding: 0; }
+      .ghg-icon-btn svg { width: 16px; height: 16px; fill: currentColor; }
+      .ghg-icon-btn:hover { color: #0969da; border-color: #0969da; background: #f6f8fa; }
+      .ghg-icon-btn.is-active { color: #0969da; border-color: #0969da; background: #ddf4ff; }
+      .ghg-source-badge { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 999px; font-size: 12px; font-weight: 600; line-height: 22px; border: 1px solid transparent; }
+      .ghg-source-badge.is-graphql { color: #1a7f37; background: #dafbe1; border-color: #4ac26b66; }
+      .ghg-source-badge.is-html { color: #57606a; background: #eaeef2; border-color: #d0d7de; }
+      .ghg-status-msg { color: #656d76; font-size: 12px; }
+      .ghg-settings { display: none; margin: 0 0 16px; padding: 16px; border: 1px solid #d0d7de; border-radius: 8px; background: #ffffff; }
+      .ghg-settings.is-open { display: block; }
+      .ghg-settings-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+      .ghg-settings-head strong { color: #1f2328; font-size: 14px; }
+      .ghg-settings-head a { color: #0969da; font-size: 13px; }
+      .ghg-settings-hint, .ghg-settings-scopes { margin: 0 0 8px; color: #57606a; font-size: 13px; line-height: 1.5; }
+      .ghg-settings-scopes { margin-bottom: 12px; }
+      .ghg-settings-row { margin-bottom: 12px; }
+      .ghg-token-input { width: 100%; height: 36px; padding: 0 12px; border: 1px solid #d0d7de; border-radius: 6px; background: #f6f8fa; color: #1f2328; font-size: 14px; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+      .ghg-token-input:focus { outline: 2px solid #0969da33; border-color: #0969da; background: #ffffff; }
+      .ghg-settings-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .ghg-btn { height: 32px; padding: 0 12px; border: 1px solid #d0d7de; border-radius: 6px; background: #f6f8fa; color: #24292f; font-size: 13px; font-weight: 600; cursor: pointer; }
+      .ghg-btn:hover:not(:disabled) { background: #eaeef2; }
+      .ghg-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+      .ghg-btn-primary { background: #1f883d; border-color: #1f883d; color: #ffffff; }
+      .ghg-btn-primary:hover:not(:disabled) { background: #1a7f37; border-color: #1a7f37; }
       .ghg-release-feed { display: grid; gap: 16px; min-width: 0; }
 
       /* ── Release card ──────────────────────────────────────────── */
@@ -1418,10 +1715,13 @@
       .ghg-rc-tag { display: block; margin-bottom: 12px; color: #1f2328; font-size: 20px; font-weight: 600; line-height: 1.3; word-break: break-word; }
       .ghg-rc-tag:hover { color: #0969da; }
 
-      /* Release notes body */
-      .ghg-rc-body { position: relative; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; min-width: 0; }
-      .ghg-rc-body-inner { padding: 16px; max-height: ${BODY_MAX_HEIGHT}px; overflow: hidden; font-size: 14px; line-height: 1.6; color: #1f2328; overflow-wrap: break-word; word-break: break-word; }
-      .ghg-rc-body-inner::after { content: ''; position: absolute; bottom: 32px; left: 0; right: 0; height: 60px; background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,1)); pointer-events: none; }
+      /* Release notes body — fixed viewport, scroll for full content */
+      .ghg-rc-body { display: flex; flex-direction: column; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; min-width: 0; }
+      .ghg-rc-body-inner { padding: 16px; max-height: ${BODY_MAX_HEIGHT}px; overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; font-size: 14px; line-height: 1.6; color: #1f2328; overflow-wrap: break-word; word-break: break-word; scrollbar-width: thin; scrollbar-color: #d0d7de transparent; }
+      .ghg-rc-body-inner::-webkit-scrollbar { width: 8px; }
+      .ghg-rc-body-inner::-webkit-scrollbar-thumb { background: #d0d7de; border-radius: 4px; }
+      .ghg-rc-body-inner::-webkit-scrollbar-thumb:hover { background: #afb8c1; }
+      .ghg-rc-body-inner::-webkit-scrollbar-track { background: transparent; }
 
       /* Markdown-ish styling for release notes */
       .ghg-rc-body-inner h1, .ghg-rc-body-inner h2, .ghg-rc-body-inner h3 { margin: 16px 0 8px; font-weight: 600; line-height: 1.3; border: 0; }
@@ -1501,10 +1801,12 @@
 
   // ── Boot ───────────────────────────────────────────────────────────────
 
-  function boot() {
+  function boot({ langOnly = false } = {}) {
     if (!isGithubHome()) {
       document.body.classList.remove(ACTIVE_CLASS);
       document.getElementById(ROOT_ID)?.remove();
+      document.getElementById(STYLE_ID)?.remove();
+      stylesInjected = false;
       lastData = null;
       lastDataKey = '';
       releaseLoadKey = '';
@@ -1517,262 +1819,70 @@
       return;
     }
 
-    // Capture native feed release activity BEFORE we hide the dashboard feed.
-    // Must run prior to renderWorkbench() which applies ACTIVE_CLASS CSS.
-    // Delayed boots (300–5000ms) re-run this once Turbo finishes painting the feed.
-    let seedSnapshot = { seeds: feedReleaseSeeds, hints: feedReleaseHints };
-    try { seedSnapshot = captureNativeFeedSnapshot(); } catch (error) { /* ignore */ }
+    // Language switch: re-render labels without re-fetching data
+    if (langOnly && lastData && document.getElementById(ROOT_ID)) {
+      lastDataKey = dataKey(lastData);
+      renderWorkbench(lastData);
+      return;
+    }
 
     const data = collectGithubData();
     const key = dataKey(data);
     if (lastData && lastDataKey === key && document.getElementById(ROOT_ID)) {
-      if (lastData.releaseStatus === 'loading') {
-        loadReleasesFor(lastData, key);
-        return;
-      }
-      // Same SPA session / turbo revisit: soft-revalidate after MEMORY_REFRESH_MS
-      // instead of permanently freezing the first successful paint in memory.
-      const age = Date.now() - (lastData.releaseFetchedAt || 0);
-      if (age >= MEMORY_REFRESH_MS) {
-        loadReleasesFor(lastData, key, { force: false });
-        return;
-      }
-      // If the native feed painted later and revealed new release repos we
-      // haven't loaded yet, force a revalidation so they appear immediately.
-      const knownRepos = new Set((lastData.releaseItems || []).map((item) => item.repoName));
-      const newSeeds = (seedSnapshot.seeds || []).filter((repo) => !knownRepos.has(repo.name));
-      if (newSeeds.length) {
-        console.info(`${LOG_PREFIX} new feed seeds after paint`, newSeeds.map((repo) => repo.name));
-        loadReleasesFor(lastData, key, { force: false });
-      }
+      if (lastData.releaseStatus === 'loading') loadReleasesFor(lastData, key);
       return;
     }
 
-    // Preserve already-fetched release cards across re-boots when only the
-    // left/right chrome needs re-scraping (e.g. mutation observer re-entry).
-    if (lastData && lastDataKey === key && lastData.releaseItems?.length) {
+    // Preserve in-flight / ready feed across soft navigations when user is the same
+    if (lastData && lastData.userName === data.userName && lastData.releaseItems?.length) {
       data.releaseItems = lastData.releaseItems;
       data.releaseStatus = lastData.releaseStatus;
-      data.releaseFetchedAt = lastData.releaseFetchedAt || 0;
+      data.feedSource = lastData.feedSource;
+      data.feedStale = lastData.feedStale;
+      data.statusMessage = lastData.statusMessage;
     }
 
     lastData = data;
     lastDataKey = key;
     renderWorkbench(lastData);
-
-    const needsLoad = lastData.releaseStatus === 'loading'
-      || !lastData.releaseFetchedAt
-      || (Date.now() - lastData.releaseFetchedAt) >= MEMORY_REFRESH_MS;
-    if (needsLoad) {
-      loadReleasesFor(lastData, key, { force: false });
-    }
-  }
-
-  function clearReleaseCaches() {
-    const removed = [];
-    try {
-      Object.keys(localStorage)
-        .filter((key) => key.startsWith(CACHE_PREFIX))
-        .forEach((key) => {
-          localStorage.removeItem(key);
-          removed.push(key);
-        });
-    } catch (error) {
-      console.warn(`${LOG_PREFIX} failed to clear localStorage cache`, error);
-    }
-    return removed;
-  }
-
-  async function hardRefreshReleases() {
-    const removed = clearReleaseCaches();
-    releaseLoadKey = '';
-    releaseRequestId += 1;
-
-    if (!isGithubHome() || !isLoggedInHome()) {
-      lastData = null;
-      lastDataKey = '';
-      scheduleBoot();
-      console.info(`${LOG_PREFIX} cache cleared (${removed.length}); waiting for home page`, {
-        version: SCRIPT_VERSION,
-      });
-      return { removed: removed.length, status: 'deferred' };
-    }
-
-    if (!lastData) {
-      scheduleBoot();
-      console.info(`${LOG_PREFIX} cache cleared (${removed.length}); rebooting`, {
-        version: SCRIPT_VERSION,
-      });
-      return { removed: removed.length, status: 'reboot' };
-    }
-
-    lastData.releaseStatus = 'loading';
-    // Keep existing cards visible while we refetch.
-    lastData.releaseFetchedAt = 0;
-    renderWorkbench(lastData);
-
-    const key = lastDataKey || dataKey(lastData);
-    loadReleasesFor(lastData, key, { force: true });
-    console.info(`${LOG_PREFIX} hard refresh started`, {
-      version: SCRIPT_VERSION,
-      removed: removed.length,
-      user: lastData.userName,
-    });
-    return { removed: removed.length, status: 'loading' };
-  }
-
-  function publishState() {
-    const state = {
-      version: SCRIPT_VERSION,
-      lastDataKey,
-      releaseLoadKey,
-      releaseStatus: lastData?.releaseStatus || null,
-      releaseCount: lastData?.releaseItems?.length || 0,
-      releaseFetchedAt: lastData?.releaseFetchedAt || 0,
-      userName: lastData?.userName || null,
-      feedSeedCount: feedReleaseSeeds.length,
-      feedHintCount: feedReleaseHints.length,
-      feedSeeds: feedReleaseSeeds.slice(0, 12).map((repo) => repo.name),
-      feedHints: feedReleaseHints.slice(0, 8).map((item) => `${item.repoName}@${item.tagName}`),
-      topTags: (lastData?.releaseItems || []).slice(0, 8).map((item) => ({
-        repo: item.repoName,
-        tag: item.tagName,
-        at: item.createdAt,
-        ms: item.createdAtMs || 0,
-        source: item.source || 'atom',
-      })),
-    };
-    try {
-      document.documentElement.setAttribute(DOM_STATE_ATTR, JSON.stringify(state));
-    } catch (error) {
-      // ignore
-    }
-    return state;
-  }
-
-  function handleExternalCommand(raw) {
-    const value = String(raw || '').trim();
-    if (!value) return;
-    const [cmdRaw, argRaw = ''] = value.split(':');
-    const cmd = cmdRaw.toLowerCase();
-    const arg = argRaw.trim();
-
-    if (cmd === 'refresh' || cmd === 'hard-refresh' || cmd === 'reload') {
-      hardRefreshReleases();
-    } else if (cmd === 'clear' || cmd === 'clear-cache') {
-      clearReleaseCaches();
-      publishState();
-    } else if (cmd === 'state' || cmd === 'ping') {
-      console.info(`${LOG_PREFIX} state`, publishState());
-    } else if (cmd === 'scan-feed') {
-      const snap = captureNativeFeedSnapshot();
-      console.info(`${LOG_PREFIX} scan-feed`, snap);
-      publishState();
-    } else if (cmd === 'has' || cmd === 'find') {
-      const needle = arg.toLowerCase();
-      const state = publishState();
-      const inTop = (state.topTags || []).filter((item) =>
-        `${item.repo}@${item.tag}`.toLowerCase().includes(needle)
-      );
-      const inSeeds = feedReleaseSeeds.filter((repo) => repo.name.toLowerCase().includes(needle));
-      const inHints = feedReleaseHints.filter((item) =>
-        `${item.repoName}@${item.tagName}`.toLowerCase().includes(needle)
-      );
-      const inItems = (lastData?.releaseItems || []).filter((item) =>
-        `${item.repoName}@${item.tagName}`.toLowerCase().includes(needle)
-      );
-      console.info(`${LOG_PREFIX} find "${arg}"`, { inTop, inSeeds, inHints, inItems });
-    }
-  }
-
-  function installCommandBridge() {
-    // Page-console bridge that does NOT inject a <script> (CSP-safe).
-    // From Safari Web Inspector on github.com:
-    //   document.documentElement.setAttribute('data-ghg-cmd', 'refresh')
-    //   document.documentElement.getAttribute('data-ghg-home-enhancer')  // "1.1.4"
-    //   JSON.parse(document.documentElement.getAttribute('data-ghg-state') || '{}')
-    try {
-      const observer = new MutationObserver((mutations) => {
-        for (const mutation of mutations) {
-          if (mutation.type !== 'attributes') continue;
-          if (mutation.attributeName !== DOM_CMD_ATTR) continue;
-          const value = document.documentElement.getAttribute(DOM_CMD_ATTR);
-          if (!value) continue;
-          document.documentElement.removeAttribute(DOM_CMD_ATTR);
-          handleExternalCommand(value);
-        }
-      });
-      observer.observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: [DOM_CMD_ATTR],
-      });
-    } catch (error) {
-      console.warn(`${LOG_PREFIX} command bridge failed`, error);
-    }
-
-    // Also accept bubbling CustomEvents from same document (works if worlds share events).
-    try {
-      document.addEventListener('ghg-home-enhancer', (event) => {
-        handleExternalCommand(event?.detail?.cmd || event?.detail || 'refresh');
-      });
-    } catch (error) {
-      // ignore
-    }
-  }
-
-  function exposeApi() {
-    markVersionOnDom();
-    publishState();
-    installCommandBridge();
-
-    const api = {
-      version: SCRIPT_VERSION,
-      refresh: hardRefreshReleases,
-      clearCache: clearReleaseCaches,
-      getState: publishState,
-    };
-
-    // Best-effort window export. Safari Userscripts often isolate window from
-    // the page console — if so, use the DOM attribute bridge above instead.
-    const targets = [];
-    try { targets.push(window); } catch (error) { /* ignore */ }
-    try {
-      if (typeof unsafeWindow !== 'undefined' && unsafeWindow) targets.push(unsafeWindow);
-    } catch (error) {
-      // ignore
-    }
-
-    for (const target of targets) {
-      try {
-        target.__ghgHomeEnhancer = api;
-        target.__ghgRefreshReleases = hardRefreshReleases;
-        target.__GHG_HOME_ENHANCER_VERSION__ = SCRIPT_VERSION;
-      } catch (error) {
-        // ignore read-only window bindings
-      }
-    }
+    loadReleasesFor(lastData, key);
   }
 
   let scheduled = false;
-  function scheduleBoot() {
+  let scheduledLangOnly = false;
+  function scheduleBoot(options = {}) {
+    if (options.langOnly) scheduledLangOnly = true;
     if (scheduled) return;
     scheduled = true;
     window.setTimeout(() => {
+      const langOnly = scheduledLangOnly;
       scheduled = false;
-      boot();
+      scheduledLangOnly = false;
+      boot({ langOnly });
     }, 0);
   }
 
-  exposeApi();
   scheduleBoot();
   [300, 1000, 2500, 5000].forEach((delay) => {
-    window.setTimeout(scheduleBoot, delay);
+    window.setTimeout(() => scheduleBoot(), delay);
   });
   new MutationObserver((mutations) => {
-    const langChanged = mutations.some((mutation) => mutation.type === 'attributes' && mutation.attributeName === 'lang');
-    if (isGithubHome() && (langChanged || !document.getElementById(ROOT_ID))) scheduleBoot();
-  }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['lang'] });
-  window.addEventListener('turbo:load', scheduleBoot);
-  window.addEventListener('turbo:render', scheduleBoot);
-  window.addEventListener('pjax:end', scheduleBoot);
+    if (!isGithubHome()) return;
+    const langChanged = mutations.some((mutation) => (
+      mutation.type === 'attributes' && mutation.attributeName === 'lang'
+    ));
+    if (langChanged) {
+      scheduleBoot({ langOnly: true });
+      return;
+    }
+    if (!document.getElementById(ROOT_ID)) scheduleBoot();
+  }).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['lang'],
+  });
+  window.addEventListener('turbo:load', () => scheduleBoot());
+  window.addEventListener('turbo:render', () => scheduleBoot());
+  window.addEventListener('pjax:end', () => scheduleBoot());
 })();
