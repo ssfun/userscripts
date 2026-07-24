@@ -5,10 +5,15 @@
 // @version      1.3.0
 // @description  在 gemini.google.com 左侧导航展开显示「我的 Gem」。点击走站点 Angular Router + 清空当前会话，打开对应 Gem 的新对话（与原生行为一致）。访问 /gems/view 时自动同步，也可手动刷新。
 // @description:en Expand "My Gems" in the Gemini sidenav. Clicks use Angular Router and clear the current conversation so the Gem opens as a new chat. Auto-sync on /gems/view; manual refresh supported.
-// @author       jiegto
+// @author       sfun
+// @license      MIT
+// @homepageURL  https://github.com/ssfun/userscripts
+// @supportURL   https://github.com/ssfun/userscripts/issues
 // @match        https://gemini.google.com/*
 // @run-at       document-idle
 // @grant        none
+// @downloadURL https://github.com/ssfun/userscripts/raw/refs/heads/main/gemini-gems-sidenav.user.js
+// @updateURL https://github.com/ssfun/userscripts/raw/refs/heads/main/gemini-gems-sidenav.user.js
 // ==/UserScript==
 
 (function () {
