@@ -2,9 +2,9 @@
 // @name         GitHub 首页增强
 // @name:en      GitHub Home Enhancer
 // @namespace    https://github.com/ssfun/userscripts
-// @version      2.0.0
-// @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库近 7 天有推送的 Release 动态。可选 PAT GraphQL / HTML 兜底。
-// @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with Release Radar for starred repos pushed in the last 7 days. Optional PAT GraphQL / HTML fallback.
+// @version      2.1.0
+// @description  将 GitHub 登录首页重排为工作台式三栏动态首页，中间栏展示 starred 仓库近 7 天有推送的 Release 动态。HTML 路径只扫 recently updated 前两页；可选 PAT GraphQL。
+// @description:en Rebuilds the signed-in GitHub home page into a three-column workbench with Release Radar. HTML path scrapes only the top recently-updated starred pages; optional PAT GraphQL.
 // @author       sfun
 // @license      MIT
 // @homepageURL  https://github.com/ssfun/userscripts
@@ -29,7 +29,7 @@
   const GRAPHQL_CACHE_KEY = 'graphql-feed-v4';
   const GRAPHQL_ACTIVE_CACHE_KEY = 'graphql-active-repos-v1';
   const HTML_FEED_CACHE_KEY = 'html-feed-v1';
-  const STARS_CACHE_KEY = 'starred-repos-v2';
+  const STARS_CACHE_KEY = 'starred-repos-updated-v1'; // recently updated top pages only
   const STYLE_ID = 'gh-home-enhancer-styles';
 
   const STARS_CACHE_TTL = 6 * 3600 * 1000;
@@ -48,8 +48,9 @@
   const ACTIVE_REPO_DAYS = 7;
   const ACTIVE_MS = ACTIVE_REPO_DAYS * 24 * 3600 * 1000;
   const HTML_ATOM_CONCURRENCY = 10;
-  const HTML_HOT_STAR_PAGES = 2;
-  const HTML_FULL_STARS_MAX_PAGES = 15;
+  // /stars/{user}/repositories?sort=updated is already ordered by recent activity.
+  // Two pages (~60 repos) is enough for a 7-day release radar and far cheaper than full stars crawl.
+  const HTML_UPDATED_STAR_PAGES = 2;
   const BODY_MAX_HEIGHT = 280; // px, scrollable release notes viewport
   const TOKEN_CREATE_URL = 'https://github.com/settings/tokens/new?description=GitHub%20Home%20Enhancer&scopes=read:user';
   const REPO_NAME_RE = /^[A-Za-z0-9_.-]+$/;
@@ -63,7 +64,6 @@
   let stylesInjected = false;
   let cachedToken = null; // null = unread; string = value (may be '')
   let pendingStatusMessage = '';
-  let legacyStarsCacheCleared = false;
 
   const LABELS = {
     en: {
@@ -473,39 +473,6 @@
 
   // ── Starred repos & releases fetching ─────────────────────────────────
 
-  /** Find the cursor-based "Next" link on GitHub's stars page. */
-  function findStarsNextUrl(doc) {
-    // Current GitHub stars UI: <div data-test-selector="pagination"> with BtnGroup Next
-    const pagination = doc.querySelector('[data-test-selector="pagination"]');
-    if (pagination) {
-      const nextBtn = Array.from(pagination.querySelectorAll('a.btn, a')).find((a) => {
-        const text = compact(a.textContent).toLowerCase();
-        const href = a.getAttribute('href') || '';
-        return (text === 'next' || href.includes('after='))
-          && !a.classList.contains('disabled')
-          && a.getAttribute('aria-disabled') !== 'true'
-          && !a.hasAttribute('disabled');
-      });
-      if (nextBtn?.getAttribute('href')) {
-        return safeGithubUrl(nextBtn.getAttribute('href'));
-      }
-    }
-
-    // Fallback: any Next / after= link (legacy or alternate layouts)
-    const candidates = Array.from(doc.querySelectorAll(
-      'a.next_page, a[rel="next"], .pagination a[href*="after="], a.btn.BtnGroup-item[href*="after="], a[href*="after="][href*="tab=stars"]'
-    ));
-    for (const link of candidates) {
-      const href = link.getAttribute('href');
-      if (!href) continue;
-      if (link.classList.contains('disabled') || link.getAttribute('aria-disabled') === 'true') continue;
-      const text = compact(link.textContent).toLowerCase();
-      if (text && text !== 'next' && !href.includes('after=')) continue;
-      return safeGithubUrl(href);
-    }
-    return null;
-  }
-
   function parseStarredReposFromDoc(doc) {
     const repoLinks = Array.from(doc.querySelectorAll([
       'h3 a[href^="/"]',
@@ -528,70 +495,61 @@
         href: `https://github.com/${owner}/${repo}`,
       });
     }
-    return repos;
+    return uniqueBy(repos, (repo) => repo.name);
   }
 
-  async function scrapeStarredRepoPages(userName, { maxPages = HTML_FULL_STARS_MAX_PAGES } = {}) {
-    const repos = [];
-    let nextUrl = `https://github.com/${encodeURIComponent(userName)}?tab=stars`;
-    let page = 0;
+  function starredUpdatedPageUrl(userName, page) {
+    const params = new URLSearchParams({
+      direction: 'desc',
+      filter: 'all',
+      sort: 'updated',
+    });
+    if (page > 1) params.set('page', String(page));
+    return `https://github.com/stars/${encodeURIComponent(userName)}/repositories?${params}`;
+  }
 
-    while (nextUrl && page < maxPages) {
-      page++;
-      const response = await fetch(nextUrl, { credentials: 'same-origin' });
-      if (!response.ok) break;
-
+  /**
+   * HTML fast path: scrape /stars/{user}/repositories?sort=updated.
+   * That list is already ordered by recent activity, so the first N pages
+   * cover the same intent as "repos pushed in the last 7 days" without a full stars crawl.
+   */
+  async function scrapeRecentlyUpdatedStarredRepos(userName, maxPages = HTML_UPDATED_STAR_PAGES) {
+    const pageIndexes = Array.from({ length: maxPages }, (_, i) => i + 1);
+    const pageResults = await mapPool(pageIndexes, async (page) => {
+      const response = await fetch(starredUpdatedPageUrl(userName, page), {
+        credentials: 'same-origin',
+      });
+      if (!response.ok) return [];
       const html = await response.text();
       const doc = new DOMParser().parseFromString(html, 'text/html');
-      const pageRepos = parseStarredReposFromDoc(doc);
-      if (!pageRepos.length) break;
+      return parseStarredReposFromDoc(doc);
+    }, Math.min(2, maxPages));
 
-      repos.push(...pageRepos);
-
-      const following = findStarsNextUrl(doc);
-      nextUrl = following && following !== nextUrl ? following : null;
-    }
-
+    // Keep page order: page1 repos first, then page2, ...
+    const repos = [];
+    pageResults.forEach((list) => {
+      if (Array.isArray(list)) repos.push(...list);
+    });
     return {
-      pages: page,
+      pages: pageResults.filter((list) => list?.length).length,
       repos: uniqueBy(repos, (repo) => repo.name),
     };
   }
 
   async function fetchStarredRepos(userName, { force = false } = {}) {
-    // Cursor pagination — GitHub stars no longer supports ?page=N
     if (!force) {
       const cached = cacheGet(STARS_CACHE_KEY);
       if (cached?.length) return cached;
     }
 
-    // One-time drop of legacy page-based cache
-    if (!legacyStarsCacheCleared) {
-      legacyStarsCacheCleared = true;
-      try {
-        localStorage.removeItem(CACHE_PREFIX + 'starred-repos');
-      } catch (error) {
-        // ignore
-      }
-    }
-
-    const previous = cacheGetEntry(STARS_CACHE_KEY)?.data || [];
-    const needFull = force || !previous.length;
-    const scraped = await scrapeStarredRepoPages(userName, {
-      maxPages: needFull ? HTML_FULL_STARS_MAX_PAGES : HTML_HOT_STAR_PAGES,
-    });
-
-    const uniqueRepos = needFull
-      ? scraped.repos
-      : uniqueBy([...scraped.repos, ...previous], (repo) => repo.name);
-
+    const scraped = await scrapeRecentlyUpdatedStarredRepos(userName, HTML_UPDATED_STAR_PAGES);
     console.debug(`${LOG_PREFIX} fetched starred repos`, {
       pages: scraped.pages,
-      count: uniqueRepos.length,
-      mode: needFull ? 'full' : 'hot-merge',
+      count: scraped.repos.length,
+      mode: 'updated-top',
     });
-    if (uniqueRepos.length) cacheSet(STARS_CACHE_KEY, uniqueRepos, STARS_CACHE_TTL);
-    return uniqueRepos;
+    if (scraped.repos.length) cacheSet(STARS_CACHE_KEY, scraped.repos, STARS_CACHE_TTL);
+    return scraped.repos;
   }
 
   function parseAtomReleaseEntry(entry, repo) {
