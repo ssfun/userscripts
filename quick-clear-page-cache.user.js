@@ -2,9 +2,9 @@
 // @name         快速清理网页缓存
 // @name:en      Quick Clear Page Cache
 // @namespace    https://github.com/ssfun/userscripts
-// @version      1.1.0
-// @description  通过油猴菜单一键清理当前网页的 localStorage / sessionStorage / Cookie / IndexedDB / Cache Storage / Service Worker，并支持强制刷新。悬浮按钮默认隐藏。
-// @description:en Clear current site data via userscript menu (storage, cookies, IndexedDB, caches, service workers) and hard reload. Floating button hidden by default.
+// @version      1.2.0
+// @description  通过油猴菜单一键打开清理面板，清理当前网页的 localStorage / sessionStorage / Cookie / IndexedDB / Cache Storage / Service Worker，并支持强制刷新。悬浮按钮默认隐藏。
+// @description:en Open a panel via the userscript menu to clear current site data (storage, cookies, IndexedDB, caches, service workers) and hard reload. Floating button hidden by default.
 // @author       sfun
 // @license      MIT
 // @match        *://*/*
@@ -20,7 +20,7 @@
   'use strict';
 
   if (window.top !== window.self) return;
-  if (document.getElementById('qcc-root')) return;
+  if (document.getElementById('qcc-host')) return;
 
   const NS = 'qcc';
   const HOTKEY = { key: 'k', alt: true, shift: true }; // Alt+Shift+K
@@ -53,218 +53,277 @@
     }
   }
 
-  // ---------- styles ----------
-  const style = document.createElement('style');
-  style.textContent = `
-    #${NS}-root {
-      --qcc-bg: #111827;
-      --qcc-panel: #1f2937;
-      --qcc-border: #374151;
-      --qcc-text: #f9fafb;
-      --qcc-muted: #9ca3af;
-      --qcc-accent: #3b82f6;
-      --qcc-danger: #ef4444;
-      --qcc-ok: #22c55e;
-      --qcc-shadow: 0 12px 40px rgba(0,0,0,.45);
-      all: initial;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
-        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-      font-size: 13px;
-      line-height: 1.4;
-      color: var(--qcc-text);
-      z-index: 2147483646;
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-    }
-    #${NS}-root * { box-sizing: border-box; }
+  // Host lives in the light DOM so it can enter the top layer (popover).
+  // Inline !important keeps page CSS from shoving it into document flow
+  // (the usual "stuck at the bottom of the page" failure).
+  const host = document.createElement('div');
+  host.id = `${NS}-host`;
+  host.setAttribute('data-qcc', '1');
+  host.setAttribute('popover', 'manual');
+  host.style.cssText = [
+    'position: fixed',
+    'inset: 0',
+    'width: auto',
+    'height: auto',
+    'max-width: none',
+    'max-height: none',
+    'margin: 0',
+    'padding: 0',
+    'border: none',
+    'background: transparent',
+    'overflow: visible',
+    'outline: none',
+    'z-index: 2147483646',
+    'pointer-events: none',
+    'box-sizing: border-box',
+    'transform: none',
+    'filter: none',
+    'contain: layout style',
+    'isolation: isolate',
+  ]
+    .map((s) => s + ' !important')
+    .join(';');
 
-    #${NS}-fab {
-      pointer-events: auto;
-      position: fixed;
-      right: 20px;
-      bottom: 20px;
-      width: 46px;
-      height: 46px;
-      border: none;
-      border-radius: 50%;
-      background: linear-gradient(135deg, #2563eb, #7c3aed);
-      color: #fff;
-      cursor: grab;
-      box-shadow: var(--qcc-shadow);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      user-select: none;
-      transition: transform .15s ease, box-shadow .15s ease;
-    }
-    #${NS}-fab.visible { display: flex; }
-    #${NS}-fab:hover {
-      transform: scale(1.06);
-      box-shadow: 0 16px 48px rgba(37,99,235,.45);
-    }
-    #${NS}-fab:active { cursor: grabbing; }
-    #${NS}-fab svg { width: 22px; height: 22px; pointer-events: none; }
+  const shadow = host.attachShadow({ mode: 'open' });
 
-    #${NS}-panel {
-      pointer-events: auto;
-      position: fixed;
-      right: 20px;
-      bottom: 20px;
-      width: 320px;
-      max-width: calc(100vw - 24px);
-      background: var(--qcc-panel);
-      border: 1px solid var(--qcc-border);
-      border-radius: 14px;
-      box-shadow: var(--qcc-shadow);
-      overflow: hidden;
-      display: none;
-      flex-direction: column;
-    }
-    #${NS}-panel.open { display: flex; }
-    #${NS}-panel.with-fab { bottom: 78px; }
+  shadow.innerHTML = `
+    <style>
+      :host {
+        position: fixed !important;
+        inset: 0 !important;
+        width: auto !important;
+        height: auto !important;
+        max-width: none !important;
+        max-height: none !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: none !important;
+        background: transparent !important;
+        overflow: visible !important;
+        outline: none !important;
+        z-index: 2147483646 !important;
+        pointer-events: none !important;
+        box-sizing: border-box !important;
+        transform: none !important;
+        filter: none !important;
+      }
+      :host(:popover-open) {
+        display: block !important;
+      }
 
-    #${NS}-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--qcc-border);
-      background: rgba(0,0,0,.15);
-    }
-    #${NS}-title {
-      font-weight: 650;
-      font-size: 14px;
-      letter-spacing: .2px;
-    }
-    #${NS}-close {
-      border: none;
-      background: transparent;
-      color: var(--qcc-muted);
-      cursor: pointer;
-      font-size: 18px;
-      line-height: 1;
-      padding: 2px 6px;
-      border-radius: 6px;
-    }
-    #${NS}-close:hover { background: rgba(255,255,255,.08); color: #fff; }
+      * { box-sizing: border-box; }
 
-    #${NS}-body { padding: 10px 12px 6px; }
-    #${NS}-site {
-      color: var(--qcc-muted);
-      font-size: 12px;
-      margin: 0 2px 10px;
-      word-break: break-all;
-    }
-    .${NS}-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 8px 8px;
-      border-radius: 8px;
-      cursor: pointer;
-      user-select: none;
-    }
-    .${NS}-row:hover { background: rgba(255,255,255,.05); }
-    .${NS}-row input {
-      width: 15px;
-      height: 15px;
-      accent-color: var(--qcc-accent);
-      cursor: pointer;
-      margin: 0;
-    }
-    .${NS}-row span { flex: 1; color: var(--qcc-text); }
+      #${NS}-root {
+        --qcc-bg: #111827;
+        --qcc-panel: #1f2937;
+        --qcc-border: #374151;
+        --qcc-text: #f9fafb;
+        --qcc-muted: #9ca3af;
+        --qcc-accent: #3b82f6;
+        --qcc-danger: #ef4444;
+        --qcc-ok: #22c55e;
+        --qcc-shadow: 0 12px 40px rgba(0,0,0,.45);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+        font-size: 13px;
+        line-height: 1.4;
+        color: var(--qcc-text);
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+      }
 
-    #${NS}-actions {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      padding: 10px 12px 12px;
-    }
-    #${NS}-actions button {
-      border: none;
-      border-radius: 9px;
-      padding: 9px 10px;
-      font-size: 13px;
-      font-weight: 600;
-      cursor: pointer;
-      color: #fff;
-    }
-    #${NS}-clear {
-      background: linear-gradient(135deg, #2563eb, #4f46e5);
-    }
-    #${NS}-clear:hover { filter: brightness(1.08); }
-    #${NS}-clear:disabled {
-      opacity: .55;
-      cursor: not-allowed;
-      filter: none;
-    }
-    #${NS}-reload {
-      background: #374151;
-    }
-    #${NS}-reload:hover { background: #4b5563; }
+      #${NS}-fab {
+        pointer-events: auto;
+        position: absolute;
+        right: 20px;
+        bottom: 20px;
+        width: 46px;
+        height: 46px;
+        border: none;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #2563eb, #7c3aed);
+        color: #fff;
+        cursor: grab;
+        box-shadow: var(--qcc-shadow);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        user-select: none;
+        transition: transform .15s ease, box-shadow .15s ease;
+      }
+      #${NS}-fab.visible { display: flex; }
+      #${NS}-fab:hover {
+        transform: scale(1.06);
+        box-shadow: 0 16px 48px rgba(37,99,235,.45);
+      }
+      #${NS}-fab:active { cursor: grabbing; }
+      #${NS}-fab svg { width: 22px; height: 22px; pointer-events: none; }
 
-    #${NS}-footer {
-      padding: 0 14px 12px;
-      color: var(--qcc-muted);
-      font-size: 11px;
-    }
-    #${NS}-log {
-      margin-top: 4px;
-      min-height: 18px;
-      color: var(--qcc-ok);
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    #${NS}-log.error { color: var(--qcc-danger); }
-  `;
-  document.documentElement.appendChild(style);
+      #${NS}-panel {
+        pointer-events: auto;
+        position: absolute;
+        right: 20px;
+        bottom: 20px;
+        width: 320px;
+        max-width: calc(100vw - 24px);
+        background: var(--qcc-panel);
+        border: 1px solid var(--qcc-border);
+        border-radius: 14px;
+        box-shadow: var(--qcc-shadow);
+        overflow: hidden;
+        display: none;
+        flex-direction: column;
+      }
+      #${NS}-panel.open { display: flex; }
+      #${NS}-panel.with-fab { bottom: 78px; }
 
-  // ---------- DOM ----------
-  const root = document.createElement('div');
-  root.id = `${NS}-root`;
-  root.innerHTML = `
-    <button id="${NS}-fab" type="button" title="清理网页缓存 (Alt+Shift+K)" aria-label="清理网页缓存">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-           stroke-linecap="round" stroke-linejoin="round">
-        <path d="M3 6h18"/>
-        <path d="M8 6V4h8v2"/>
-        <path d="M19 6l-1 14H6L5 6"/>
-        <path d="M10 11v6"/>
-        <path d="M14 11v6"/>
-      </svg>
-    </button>
-    <div id="${NS}-panel" role="dialog" aria-label="快速清理网页缓存">
-      <div id="${NS}-header">
-        <div id="${NS}-title">快速清理网页缓存</div>
-        <button id="${NS}-close" type="button" aria-label="关闭">×</button>
-      </div>
-      <div id="${NS}-body">
-        <div id="${NS}-site"></div>
-        <div id="${NS}-options"></div>
-      </div>
-      <div id="${NS}-actions">
-        <button id="${NS}-clear" type="button">立即清理</button>
-        <button id="${NS}-reload" type="button">仅强制刷新</button>
-      </div>
-      <div id="${NS}-footer">
-        快捷键：Alt + Shift + K · 油猴菜单可开关悬浮按钮
-        <div id="${NS}-log"></div>
+      #${NS}-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--qcc-border);
+        background: rgba(0,0,0,.15);
+      }
+      #${NS}-title {
+        font-weight: 650;
+        font-size: 14px;
+        letter-spacing: .2px;
+      }
+      #${NS}-close {
+        border: none;
+        background: transparent;
+        color: var(--qcc-muted);
+        cursor: pointer;
+        font-size: 18px;
+        line-height: 1;
+        padding: 2px 6px;
+        border-radius: 6px;
+      }
+      #${NS}-close:hover { background: rgba(255,255,255,.08); color: #fff; }
+
+      #${NS}-body { padding: 10px 12px 6px; }
+      #${NS}-site {
+        color: var(--qcc-muted);
+        font-size: 12px;
+        margin: 0 2px 10px;
+        word-break: break-all;
+      }
+      .${NS}-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 8px;
+        border-radius: 8px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .${NS}-row:hover { background: rgba(255,255,255,.05); }
+      .${NS}-row input {
+        width: 15px;
+        height: 15px;
+        accent-color: var(--qcc-accent);
+        cursor: pointer;
+        margin: 0;
+      }
+      .${NS}-row span { flex: 1; color: var(--qcc-text); }
+
+      #${NS}-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        padding: 10px 12px 12px;
+      }
+      #${NS}-actions button {
+        border: none;
+        border-radius: 9px;
+        padding: 9px 10px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        color: #fff;
+      }
+      #${NS}-clear {
+        background: linear-gradient(135deg, #2563eb, #4f46e5);
+      }
+      #${NS}-clear:hover { filter: brightness(1.08); }
+      #${NS}-clear:disabled {
+        opacity: .55;
+        cursor: not-allowed;
+        filter: none;
+      }
+      #${NS}-reload {
+        background: #374151;
+      }
+      #${NS}-reload:hover { background: #4b5563; }
+
+      #${NS}-footer {
+        padding: 0 6px 12px;
+        color: var(--qcc-muted);
+        font-size: 11px;
+      }
+      #${NS}-hint {
+        padding: 0 8px;
+      }
+      #${NS}-log {
+        margin-top: 4px;
+        padding: 0 8px;
+        min-height: 18px;
+        color: var(--qcc-ok);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      #${NS}-log.error { color: var(--qcc-danger); }
+    </style>
+    <div id="${NS}-root">
+      <button id="${NS}-fab" type="button" title="清理网页缓存 (Alt+Shift+K)" aria-label="清理网页缓存">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 6h18"/>
+          <path d="M8 6V4h8v2"/>
+          <path d="M19 6l-1 14H6L5 6"/>
+          <path d="M10 11v6"/>
+          <path d="M14 11v6"/>
+        </svg>
+      </button>
+      <div id="${NS}-panel" role="dialog" aria-label="快速清理网页缓存">
+        <div id="${NS}-header">
+          <div id="${NS}-title">快速清理网页缓存</div>
+          <button id="${NS}-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div id="${NS}-body">
+          <div id="${NS}-site"></div>
+          <div id="${NS}-options"></div>
+        </div>
+        <div id="${NS}-actions">
+          <button id="${NS}-clear" type="button">立即清理</button>
+          <button id="${NS}-reload" type="button">仅强制刷新</button>
+        </div>
+        <div id="${NS}-footer">
+          <label class="${NS}-row">
+            <input type="checkbox" id="${NS}-show-fab">
+            <span>显示悬浮按钮</span>
+          </label>
+          <div id="${NS}-hint">快捷键：Alt + Shift + K</div>
+          <div id="${NS}-log"></div>
+        </div>
       </div>
     </div>
   `;
-  document.documentElement.appendChild(root);
 
-  const fab = root.querySelector(`#${NS}-fab`);
-  const panel = root.querySelector(`#${NS}-panel`);
-  const optionsEl = root.querySelector(`#${NS}-options`);
-  const siteEl = root.querySelector(`#${NS}-site`);
-  const logEl = root.querySelector(`#${NS}-log`);
-  const clearBtn = root.querySelector(`#${NS}-clear`);
-  const reloadBtn = root.querySelector(`#${NS}-reload`);
-  const closeBtn = root.querySelector(`#${NS}-close`);
+  const fab = shadow.getElementById(`${NS}-fab`);
+  const panel = shadow.getElementById(`${NS}-panel`);
+  const optionsEl = shadow.getElementById(`${NS}-options`);
+  const siteEl = shadow.getElementById(`${NS}-site`);
+  const logEl = shadow.getElementById(`${NS}-log`);
+  const clearBtn = shadow.getElementById(`${NS}-clear`);
+  const reloadBtn = shadow.getElementById(`${NS}-reload`);
+  const closeBtn = shadow.getElementById(`${NS}-close`);
+  const showFabEl = shadow.getElementById(`${NS}-show-fab`);
 
   siteEl.textContent = location.origin;
+  showFabEl.checked = getShowFab();
 
   for (const opt of OPTIONS) {
     const row = document.createElement('label');
@@ -276,7 +335,49 @@
     optionsEl.appendChild(row);
   }
 
-  // ---------- helpers ----------
+  const canPopover = typeof host.showPopover === 'function';
+
+  function mount() {
+    const parent = document.documentElement;
+    if (host.parentNode !== parent) parent.appendChild(host);
+  }
+
+  function showHost() {
+    mount();
+    if (canPopover) {
+      if (host.matches && host.matches(':popover-open')) return;
+      try {
+        host.showPopover();
+      } catch (_) {
+        /* not connected or already open */
+      }
+    } else {
+      host.style.setProperty('display', 'block', 'important');
+    }
+  }
+
+  function hideHost() {
+    if (canPopover) {
+      if (host.matches && !host.matches(':popover-open')) return;
+      try {
+        host.hidePopover();
+      } catch (_) {
+        /* ignore */
+      }
+    } else {
+      host.style.setProperty('display', 'none', 'important');
+    }
+  }
+
+  function hostNeeded() {
+    return panel.classList.contains('open') || getShowFab();
+  }
+
+  function syncHost() {
+    if (hostNeeded()) showHost();
+    else hideHost();
+  }
+
   function setLog(msg, isError = false) {
     logEl.textContent = msg || '';
     logEl.classList.toggle('error', !!isError);
@@ -292,27 +393,30 @@
 
   function applyFabVisibility() {
     const show = getShowFab();
+    showFabEl.checked = show;
     fab.classList.toggle('visible', show);
     panel.classList.toggle('with-fab', show);
     if (!show) {
-      // 无按钮时用右下角固定面板位置
       panel.style.left = '';
       panel.style.top = '';
       panel.style.right = '20px';
-      panel.style.bottom = '20px';
+      panel.style.bottom = '';
     } else if (fab._placePanel) {
       fab._placePanel();
     }
+    syncHost();
   }
 
   function openPanel() {
     panel.classList.add('open');
     setLog('');
+    syncHost();
     if (getShowFab() && fab._placePanel) fab._placePanel();
   }
 
   function closePanel() {
     panel.classList.remove('open');
+    syncHost();
   }
 
   function togglePanel() {
@@ -449,16 +553,6 @@
     }
   }
 
-  async function runClearAllNow() {
-    // 菜单快捷入口：按默认选项全清并强制刷新
-    optionsEl.querySelectorAll('input[type="checkbox"]').forEach((el) => {
-      const opt = OPTIONS.find((o) => o.id === el.dataset.id);
-      el.checked = opt ? opt.default : true;
-    });
-    openPanel();
-    await runClear();
-  }
-
   // ---------- drag FAB ----------
   (function enableDrag() {
     let dragging = false;
@@ -561,7 +655,7 @@
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('resize', () => {
-      if (panel.classList.contains('open')) placePanelNearFab();
+      if (panel.classList.contains('open') && getShowFab()) placePanelNearFab();
     });
 
     fab._placePanel = placePanelNearFab;
@@ -572,6 +666,10 @@
   closeBtn.addEventListener('click', closePanel);
   clearBtn.addEventListener('click', runClear);
   reloadBtn.addEventListener('click', hardReload);
+  showFabEl.addEventListener('change', () => {
+    setShowFab(showFabEl.checked);
+    applyFabVisibility();
+  });
 
   document.addEventListener('keydown', (e) => {
     if (
@@ -593,40 +691,24 @@
     'mousedown',
     (e) => {
       if (!panel.classList.contains('open')) return;
-      const t = e.target;
-      if (panel.contains(t) || fab.contains(t)) return;
+      const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+      if (path.includes(panel) || path.includes(fab) || path.includes(host)) return;
       closePanel();
     },
     true
   );
 
-  // ---------- GM menu ----------
-  function registerMenus() {
-    if (typeof GM_registerMenuCommand !== 'function') return;
+  // SPA / framework may rebuild <html> children and drop the host.
+  const mo = new MutationObserver(() => {
+    if (!host.isConnected && hostNeeded()) {
+      showHost();
+    }
+  });
+  mo.observe(document.documentElement, { childList: true });
 
-    GM_registerMenuCommand('🧹 打开清理面板', () => {
-      openPanel();
-    });
-
-    GM_registerMenuCommand('⚡ 一键全清并刷新', () => {
-      runClearAllNow();
-    });
-
-    GM_registerMenuCommand('🔄 仅强制刷新', () => {
-      hardReload();
-    });
-
-    GM_registerMenuCommand(
-      getShowFab() ? '👁️ 隐藏悬浮按钮' : '👁️ 显示悬浮按钮',
-      () => {
-        setShowFab(!getShowFab());
-        applyFabVisibility();
-        // 重新注册菜单以刷新文案（部分脚本管理器会累积条目，这里仅切换可见性即可）
-        registerMenus();
-      }
-    );
+  if (typeof GM_registerMenuCommand === 'function') {
+    GM_registerMenuCommand('打开清理面板', openPanel);
   }
 
   applyFabVisibility();
-  registerMenus();
 })();
