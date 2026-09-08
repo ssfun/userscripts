@@ -2,7 +2,7 @@
 // @name         快速清理网页缓存
 // @name:en      Quick Clear Page Cache
 // @namespace    https://github.com/ssfun/userscripts
-// @version      1.2.0
+// @version      1.2.1
 // @description  通过油猴菜单一键打开清理面板，清理当前网页的 localStorage / sessionStorage / Cookie / IndexedDB / Cache Storage / Service Worker，并支持强制刷新。悬浮按钮默认隐藏。
 // @description:en Open a panel via the userscript menu to clear current site data (storage, cookies, IndexedDB, caches, service workers) and hard reload. Floating button hidden by default.
 // @author       sfun
@@ -23,7 +23,7 @@
   if (document.getElementById('qcc-host')) return;
 
   const NS = 'qcc';
-  const HOTKEY = { key: 'k', alt: true, shift: true }; // Alt+Shift+K
+  const HOTKEY = { code: 'KeyK', alt: true, shift: true }; // Alt/Option+Shift+K
   const POS_KEY = `${NS}:fab-pos`;
   const SHOW_FAB_KEY = `${NS}:show-fab`;
 
@@ -671,21 +671,32 @@
     applyFabVisibility();
   });
 
-  document.addEventListener('keydown', (e) => {
-    if (
-      e.altKey === HOTKEY.alt &&
-      e.shiftKey === HOTKEY.shift &&
-      !e.ctrlKey &&
-      !e.metaKey &&
-      e.key.toLowerCase() === HOTKEY.key
-    ) {
-      e.preventDefault();
-      togglePanel();
-    }
-    if (e.key === 'Escape' && panel.classList.contains('open')) {
-      closePanel();
-    }
-  });
+  function isHotkey(e) {
+    if (e.altKey !== HOTKEY.alt) return false;
+    if (e.shiftKey !== HOTKEY.shift) return false;
+    if (e.ctrlKey || e.metaKey) return false;
+    // Use e.code: on macOS Option+Shift+K produces a symbol in e.key, not "k".
+    if (e.code === HOTKEY.code) return true;
+    const key = (e.key || '').toLowerCase();
+    return key === 'k';
+  }
+
+  window.addEventListener(
+    'keydown',
+    (e) => {
+      if (isHotkey(e)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        togglePanel();
+        return;
+      }
+      if ((e.key === 'Escape' || e.code === 'Escape') && panel.classList.contains('open')) {
+        e.preventDefault();
+        closePanel();
+      }
+    },
+    true
+  );
 
   document.addEventListener(
     'mousedown',
