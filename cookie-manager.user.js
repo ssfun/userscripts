@@ -5,7 +5,7 @@
 // @version      0.2.1
 // @description  A modern cookie manager userscript: dual-engine read/write, batch CRUD, multi-select, paste-to-import, JSON export/import, multiple copy formats, undo delete, hideable floating icon, bilingual UI.
 // @description:zh-CN  现代化 Cookie 管理油猴脚本：双核引擎读写、批量增删改查、多选、粘贴解析、JSON 导入导出、多种复制格式、撤销删除、可隐藏悬浮按钮、中英双语 UI
-// @author       Minis
+// @author       sfun
 // @license      MIT
 // @homepageURL  https://github.com/ssfun/userscripts
 // @supportURL   https://github.com/ssfun/userscripts/issues
