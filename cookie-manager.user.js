@@ -94,8 +94,7 @@
             sizeBytes: n => `${n} B`,
             sizeWarn: '体积过大（>4KB 可能被截断）',
             hideFab: '隐藏悬浮按钮', showFab: '显示悬浮按钮',
-            toggleFab: '显示/隐藏悬浮按钮',
-            tFabHidden: '悬浮按钮已隐藏，可从油猴菜单重新显示',
+            tFabHidden: '悬浮按钮已隐藏，可从油猴菜单打开面板后重新显示',
             tFabShown: '悬浮按钮已显示',
         },
         en: {
@@ -134,8 +133,7 @@
             sizeBytes: n => `${n} B`,
             sizeWarn: 'Too large (>4KB may be truncated)',
             hideFab: 'Hide floating icon', showFab: 'Show floating icon',
-            toggleFab: 'Show/Hide floating icon',
-            tFabHidden: 'Floating icon hidden. Re-enable from the userscript menu.',
+            tFabHidden: 'Floating icon hidden. Re-enable from the panel (open via userscript menu).',
             tFabShown: 'Floating icon shown',
         }
     };
@@ -980,12 +978,7 @@ button{font-family:inherit}
     function boot() {
         ensureHost();
         startGuardian();
-        try {
-            if (typeof GM_registerMenuCommand === 'function') {
-                GM_registerMenuCommand(t('title'), openPanel);
-                GM_registerMenuCommand(t('toggleFab'), toggleFab);
-            }
-        } catch {}
+        try { if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand(t('title'), openPanel); } catch {}
     }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
     else boot();
