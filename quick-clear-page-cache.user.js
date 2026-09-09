@@ -2,13 +2,13 @@
 // @name         快速清理网页缓存
 // @name:en      Quick Clear Page Cache
 // @namespace    https://github.com/ssfun/userscripts
-// @version      1.2.1
+// @version      1.2.2
 // @description  通过油猴菜单一键打开清理面板，清理当前网页的 localStorage / sessionStorage / Cookie / IndexedDB / Cache Storage / Service Worker，并支持强制刷新。悬浮按钮默认隐藏。
 // @description:en Open a panel via the userscript menu to clear current site data (storage, cookies, IndexedDB, caches, service workers) and hard reload. Floating button hidden by default.
 // @author       sfun
 // @license      MIT
 // @match        *://*/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -53,303 +53,371 @@
     }
   }
 
-  // Host lives in the light DOM so it can enter the top layer (popover).
-  // Inline !important keeps page CSS from shoving it into document flow
-  // (the usual "stuck at the bottom of the page" failure).
-  const host = document.createElement('div');
-  host.id = `${NS}-host`;
-  host.setAttribute('data-qcc', '1');
-  host.setAttribute('popover', 'manual');
-  host.style.cssText = [
-    'position: fixed',
-    'inset: 0',
-    'width: auto',
-    'height: auto',
-    'max-width: none',
-    'max-height: none',
-    'margin: 0',
-    'padding: 0',
-    'border: none',
-    'background: transparent',
-    'overflow: visible',
-    'outline: none',
-    'z-index: 2147483646',
-    'pointer-events: none',
-    'box-sizing: border-box',
-    'transform: none',
-    'filter: none',
-    'contain: layout style',
-    'isolation: isolate',
-  ]
-    .map((s) => s + ' !important')
-    .join(';');
+  // Build DOM without innerHTML — YouTube/Google enforce Trusted Types.
+  function el(tag, attrs, children) {
+    const node = document.createElement(tag);
+    if (attrs) {
+      for (const [key, val] of Object.entries(attrs)) {
+        if (val == null || val === false) continue;
+        if (key === 'className') node.className = val;
+        else if (key === 'text') node.textContent = val;
+        else if (key === 'checked') node.checked = !!val;
+        else if (key === 'disabled') node.disabled = !!val;
+        else if (key === 'dataset') Object.assign(node.dataset, val);
+        else if (key === 'style' && typeof val === 'string') node.style.cssText = val;
+        else node.setAttribute(key, val === true ? '' : String(val));
+      }
+    }
+    if (children != null) {
+      const list = Array.isArray(children) ? children : [children];
+      for (const child of list) {
+        if (child == null || child === false) continue;
+        node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+      }
+    }
+    return node;
+  }
 
-  const shadow = host.attachShadow({ mode: 'open' });
+  function svgEl(tag, attrs, children) {
+    const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    if (attrs) {
+      for (const [key, val] of Object.entries(attrs)) {
+        if (val == null || val === false) continue;
+        node.setAttribute(key, String(val));
+      }
+    }
+    if (children) {
+      const list = Array.isArray(children) ? children : [children];
+      for (const child of list) node.append(child);
+    }
+    return node;
+  }
 
-  shadow.innerHTML = `
-    <style>
-      :host {
-        position: fixed !important;
-        inset: 0 !important;
-        width: auto !important;
-        height: auto !important;
-        max-width: none !important;
-        max-height: none !important;
-        margin: 0 !important;
-        padding: 0 !important;
-        border: none !important;
-        background: transparent !important;
-        overflow: visible !important;
-        outline: none !important;
-        z-index: 2147483646 !important;
-        pointer-events: none !important;
-        box-sizing: border-box !important;
-        transform: none !important;
-        filter: none !important;
-      }
-      :host(:popover-open) {
-        display: block !important;
-      }
+  const CSS = `
+    :host {
+      position: fixed !important;
+      inset: 0 !important;
+      width: auto !important;
+      height: auto !important;
+      max-width: none !important;
+      max-height: none !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      border: none !important;
+      background: transparent !important;
+      overflow: visible !important;
+      outline: none !important;
+      z-index: 2147483646 !important;
+      pointer-events: none !important;
+      box-sizing: border-box !important;
+      transform: none !important;
+      filter: none !important;
+    }
+    :host(:popover-open) {
+      display: block !important;
+    }
 
-      * { box-sizing: border-box; }
+    * { box-sizing: border-box; }
 
-      #${NS}-root {
-        --qcc-bg: #111827;
-        --qcc-panel: #1f2937;
-        --qcc-border: #374151;
-        --qcc-text: #f9fafb;
-        --qcc-muted: #9ca3af;
-        --qcc-accent: #3b82f6;
-        --qcc-danger: #ef4444;
-        --qcc-ok: #22c55e;
-        --qcc-shadow: 0 12px 40px rgba(0,0,0,.45);
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
-          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-        font-size: 13px;
-        line-height: 1.4;
-        color: var(--qcc-text);
-        position: absolute;
-        inset: 0;
-        pointer-events: none;
-      }
+    #${NS}-root {
+      --qcc-bg: #111827;
+      --qcc-panel: #1f2937;
+      --qcc-border: #374151;
+      --qcc-text: #f9fafb;
+      --qcc-muted: #9ca3af;
+      --qcc-accent: #3b82f6;
+      --qcc-danger: #ef4444;
+      --qcc-ok: #22c55e;
+      --qcc-shadow: 0 12px 40px rgba(0,0,0,.45);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      font-size: 13px;
+      line-height: 1.4;
+      color: var(--qcc-text);
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
 
-      #${NS}-fab {
-        pointer-events: auto;
-        position: absolute;
-        right: 20px;
-        bottom: 20px;
-        width: 46px;
-        height: 46px;
-        border: none;
-        border-radius: 50%;
-        background: linear-gradient(135deg, #2563eb, #7c3aed);
-        color: #fff;
-        cursor: grab;
-        box-shadow: var(--qcc-shadow);
-        display: none;
-        align-items: center;
-        justify-content: center;
-        user-select: none;
-        transition: transform .15s ease, box-shadow .15s ease;
-      }
-      #${NS}-fab.visible { display: flex; }
-      #${NS}-fab:hover {
-        transform: scale(1.06);
-        box-shadow: 0 16px 48px rgba(37,99,235,.45);
-      }
-      #${NS}-fab:active { cursor: grabbing; }
-      #${NS}-fab svg { width: 22px; height: 22px; pointer-events: none; }
+    #${NS}-fab {
+      pointer-events: auto;
+      position: absolute;
+      right: 20px;
+      bottom: 20px;
+      width: 46px;
+      height: 46px;
+      border: none;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #2563eb, #7c3aed);
+      color: #fff;
+      cursor: grab;
+      box-shadow: var(--qcc-shadow);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+      transition: transform .15s ease, box-shadow .15s ease;
+    }
+    #${NS}-fab.visible { display: flex; }
+    #${NS}-fab:hover {
+      transform: scale(1.06);
+      box-shadow: 0 16px 48px rgba(37,99,235,.45);
+    }
+    #${NS}-fab:active { cursor: grabbing; }
+    #${NS}-fab svg { width: 22px; height: 22px; pointer-events: none; }
 
-      #${NS}-panel {
-        pointer-events: auto;
-        position: absolute;
-        right: 20px;
-        bottom: 20px;
-        width: 320px;
-        max-width: calc(100vw - 24px);
-        background: var(--qcc-panel);
-        border: 1px solid var(--qcc-border);
-        border-radius: 14px;
-        box-shadow: var(--qcc-shadow);
-        overflow: hidden;
-        display: none;
-        flex-direction: column;
-      }
-      #${NS}-panel.open { display: flex; }
-      #${NS}-panel.with-fab { bottom: 78px; }
+    #${NS}-panel {
+      pointer-events: auto;
+      position: absolute;
+      right: 20px;
+      bottom: 20px;
+      width: 320px;
+      max-width: calc(100vw - 24px);
+      background: var(--qcc-panel);
+      border: 1px solid var(--qcc-border);
+      border-radius: 14px;
+      box-shadow: var(--qcc-shadow);
+      overflow: hidden;
+      display: none;
+      flex-direction: column;
+    }
+    #${NS}-panel.open { display: flex; }
+    #${NS}-panel.with-fab { bottom: 78px; }
 
-      #${NS}-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 12px 14px;
-        border-bottom: 1px solid var(--qcc-border);
-        background: rgba(0,0,0,.15);
-      }
-      #${NS}-title {
-        font-weight: 650;
-        font-size: 14px;
-        letter-spacing: .2px;
-      }
-      #${NS}-close {
-        border: none;
-        background: transparent;
-        color: var(--qcc-muted);
-        cursor: pointer;
-        font-size: 18px;
-        line-height: 1;
-        padding: 2px 6px;
-        border-radius: 6px;
-      }
-      #${NS}-close:hover { background: rgba(255,255,255,.08); color: #fff; }
+    #${NS}-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--qcc-border);
+      background: rgba(0,0,0,.15);
+    }
+    #${NS}-title {
+      font-weight: 650;
+      font-size: 14px;
+      letter-spacing: .2px;
+    }
+    #${NS}-close {
+      border: none;
+      background: transparent;
+      color: var(--qcc-muted);
+      cursor: pointer;
+      font-size: 18px;
+      line-height: 1;
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+    #${NS}-close:hover { background: rgba(255,255,255,.08); color: #fff; }
 
-      #${NS}-body { padding: 10px 12px 6px; }
-      #${NS}-site {
-        color: var(--qcc-muted);
-        font-size: 12px;
-        margin: 0 2px 10px;
-        word-break: break-all;
-      }
-      .${NS}-row {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 8px 8px;
-        border-radius: 8px;
-        cursor: pointer;
-        user-select: none;
-      }
-      .${NS}-row:hover { background: rgba(255,255,255,.05); }
-      .${NS}-row input {
-        width: 15px;
-        height: 15px;
-        accent-color: var(--qcc-accent);
-        cursor: pointer;
-        margin: 0;
-      }
-      .${NS}-row span { flex: 1; color: var(--qcc-text); }
+    #${NS}-body { padding: 10px 12px 6px; }
+    #${NS}-site {
+      color: var(--qcc-muted);
+      font-size: 12px;
+      margin: 0 2px 10px;
+      word-break: break-all;
+    }
+    .${NS}-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 8px;
+      border-radius: 8px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .${NS}-row:hover { background: rgba(255,255,255,.05); }
+    .${NS}-row input {
+      width: 15px;
+      height: 15px;
+      accent-color: var(--qcc-accent);
+      cursor: pointer;
+      margin: 0;
+    }
+    .${NS}-row span { flex: 1; color: var(--qcc-text); }
 
-      #${NS}-actions {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 8px;
-        padding: 10px 12px 12px;
-      }
-      #${NS}-actions button {
-        border: none;
-        border-radius: 9px;
-        padding: 9px 10px;
-        font-size: 13px;
-        font-weight: 600;
-        cursor: pointer;
-        color: #fff;
-      }
-      #${NS}-clear {
-        background: linear-gradient(135deg, #2563eb, #4f46e5);
-      }
-      #${NS}-clear:hover { filter: brightness(1.08); }
-      #${NS}-clear:disabled {
-        opacity: .55;
-        cursor: not-allowed;
-        filter: none;
-      }
-      #${NS}-reload {
-        background: #374151;
-      }
-      #${NS}-reload:hover { background: #4b5563; }
+    #${NS}-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      padding: 10px 12px 12px;
+    }
+    #${NS}-actions button {
+      border: none;
+      border-radius: 9px;
+      padding: 9px 10px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      color: #fff;
+    }
+    #${NS}-clear {
+      background: linear-gradient(135deg, #2563eb, #4f46e5);
+    }
+    #${NS}-clear:hover { filter: brightness(1.08); }
+    #${NS}-clear:disabled {
+      opacity: .55;
+      cursor: not-allowed;
+      filter: none;
+    }
+    #${NS}-reload {
+      background: #374151;
+    }
+    #${NS}-reload:hover { background: #4b5563; }
 
-      #${NS}-footer {
-        padding: 0 6px 12px;
-        color: var(--qcc-muted);
-        font-size: 11px;
-      }
-      #${NS}-hint {
-        padding: 0 8px;
-      }
-      #${NS}-log {
-        margin-top: 4px;
-        padding: 0 8px;
-        min-height: 18px;
-        color: var(--qcc-ok);
-        white-space: pre-wrap;
-        word-break: break-word;
-      }
-      #${NS}-log.error { color: var(--qcc-danger); }
-    </style>
-    <div id="${NS}-root">
-      <button id="${NS}-fab" type="button" title="清理网页缓存 (Alt+Shift+K)" aria-label="清理网页缓存">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-             stroke-linecap="round" stroke-linejoin="round">
-          <path d="M3 6h18"/>
-          <path d="M8 6V4h8v2"/>
-          <path d="M19 6l-1 14H6L5 6"/>
-          <path d="M10 11v6"/>
-          <path d="M14 11v6"/>
-        </svg>
-      </button>
-      <div id="${NS}-panel" role="dialog" aria-label="快速清理网页缓存">
-        <div id="${NS}-header">
-          <div id="${NS}-title">快速清理网页缓存</div>
-          <button id="${NS}-close" type="button" aria-label="关闭">×</button>
-        </div>
-        <div id="${NS}-body">
-          <div id="${NS}-site"></div>
-          <div id="${NS}-options"></div>
-        </div>
-        <div id="${NS}-actions">
-          <button id="${NS}-clear" type="button">立即清理</button>
-          <button id="${NS}-reload" type="button">仅强制刷新</button>
-        </div>
-        <div id="${NS}-footer">
-          <label class="${NS}-row">
-            <input type="checkbox" id="${NS}-show-fab">
-            <span>显示悬浮按钮</span>
-          </label>
-          <div id="${NS}-hint">快捷键：Alt + Shift + K</div>
-          <div id="${NS}-log"></div>
-        </div>
-      </div>
-    </div>
+    #${NS}-footer {
+      padding: 0 6px 12px;
+      color: var(--qcc-muted);
+      font-size: 11px;
+    }
+    #${NS}-hint {
+      padding: 0 8px;
+    }
+    #${NS}-log {
+      margin-top: 4px;
+      padding: 0 8px;
+      min-height: 18px;
+      color: var(--qcc-ok);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #${NS}-log.error { color: var(--qcc-danger); }
   `;
 
-  const fab = shadow.getElementById(`${NS}-fab`);
-  const panel = shadow.getElementById(`${NS}-panel`);
-  const optionsEl = shadow.getElementById(`${NS}-options`);
-  const siteEl = shadow.getElementById(`${NS}-site`);
-  const logEl = shadow.getElementById(`${NS}-log`);
-  const clearBtn = shadow.getElementById(`${NS}-clear`);
-  const reloadBtn = shadow.getElementById(`${NS}-reload`);
-  const closeBtn = shadow.getElementById(`${NS}-close`);
-  const showFabEl = shadow.getElementById(`${NS}-show-fab`);
+  // Host lives in the light DOM so it can enter the top layer (popover).
+  // Inline !important keeps page CSS from shoving it into document flow.
+  const host = el('div', {
+    id: `${NS}-host`,
+    'data-qcc': '1',
+    popover: 'manual',
+    style: [
+      'position: fixed',
+      'inset: 0',
+      'width: auto',
+      'height: auto',
+      'max-width: none',
+      'max-height: none',
+      'margin: 0',
+      'padding: 0',
+      'border: none',
+      'background: transparent',
+      'overflow: visible',
+      'outline: none',
+      'z-index: 2147483646',
+      'pointer-events: none',
+      'box-sizing: border-box',
+      'transform: none',
+      'filter: none',
+      'contain: layout style',
+      'isolation: isolate',
+    ]
+      .map((s) => s + ' !important')
+      .join(';'),
+  });
+
+  const shadow = host.attachShadow({ mode: 'open' });
+  const styleEl = el('style');
+  styleEl.textContent = CSS;
+
+  const fab = el(
+    'button',
+    {
+      id: `${NS}-fab`,
+      type: 'button',
+      title: '清理网页缓存 (Alt+Shift+K)',
+      'aria-label': '清理网页缓存',
+    },
+    svgEl(
+      'svg',
+      {
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        stroke: 'currentColor',
+        'stroke-width': '2',
+        'stroke-linecap': 'round',
+        'stroke-linejoin': 'round',
+      },
+      [
+        svgEl('path', { d: 'M3 6h18' }),
+        svgEl('path', { d: 'M8 6V4h8v2' }),
+        svgEl('path', { d: 'M19 6l-1 14H6L5 6' }),
+        svgEl('path', { d: 'M10 11v6' }),
+        svgEl('path', { d: 'M14 11v6' }),
+      ]
+    )
+  );
+
+  const siteEl = el('div', { id: `${NS}-site` });
+  const optionsEl = el('div', { id: `${NS}-options` });
+  const closeBtn = el('button', {
+    id: `${NS}-close`,
+    type: 'button',
+    'aria-label': '关闭',
+    text: '×',
+  });
+  const clearBtn = el('button', { id: `${NS}-clear`, type: 'button', text: '立即清理' });
+  const reloadBtn = el('button', { id: `${NS}-reload`, type: 'button', text: '仅强制刷新' });
+  const showFabEl = el('input', { id: `${NS}-show-fab`, type: 'checkbox' });
+  const logEl = el('div', { id: `${NS}-log` });
+
+  const panel = el(
+    'div',
+    { id: `${NS}-panel`, role: 'dialog', 'aria-label': '快速清理网页缓存' },
+    [
+      el('div', { id: `${NS}-header` }, [
+        el('div', { id: `${NS}-title`, text: '快速清理网页缓存' }),
+        closeBtn,
+      ]),
+      el('div', { id: `${NS}-body` }, [siteEl, optionsEl]),
+      el('div', { id: `${NS}-actions` }, [clearBtn, reloadBtn]),
+      el('div', { id: `${NS}-footer` }, [
+        el('label', { className: `${NS}-row` }, [
+          showFabEl,
+          el('span', { text: '显示悬浮按钮' }),
+        ]),
+        el('div', { id: `${NS}-hint`, text: '快捷键：Alt + Shift + K' }),
+        logEl,
+      ]),
+    ]
+  );
+
+  const root = el('div', { id: `${NS}-root` }, [fab, panel]);
+  shadow.append(styleEl, root);
 
   siteEl.textContent = location.origin;
   showFabEl.checked = getShowFab();
 
   for (const opt of OPTIONS) {
-    const row = document.createElement('label');
-    row.className = `${NS}-row`;
-    row.innerHTML = `
-      <input type="checkbox" data-id="${opt.id}" ${opt.default ? 'checked' : ''}>
-      <span>${opt.label}</span>
-    `;
-    optionsEl.appendChild(row);
+    const input = el('input', {
+      type: 'checkbox',
+      dataset: { id: opt.id },
+      checked: !!opt.default,
+    });
+    optionsEl.append(
+      el('label', { className: `${NS}-row` }, [input, el('span', { text: opt.label })])
+    );
   }
 
   const canPopover = typeof host.showPopover === 'function';
 
+  function mountParent() {
+    return document.body || document.documentElement;
+  }
+
   function mount() {
-    const parent = document.documentElement;
+    const parent = mountParent();
+    if (!parent) return false;
     if (host.parentNode !== parent) parent.appendChild(host);
+    return host.isConnected;
   }
 
   function showHost() {
-    mount();
+    if (!mount()) return;
     if (canPopover) {
       if (host.matches && host.matches(':popover-open')) return;
       try {
         host.showPopover();
       } catch (_) {
-        /* not connected or already open */
+        host.style.setProperty('display', 'block', 'important');
       }
     } else {
       host.style.setProperty('display', 'block', 'important');
@@ -385,8 +453,8 @@
 
   function selected() {
     const map = {};
-    optionsEl.querySelectorAll('input[type="checkbox"]').forEach((el) => {
-      map[el.dataset.id] = el.checked;
+    optionsEl.querySelectorAll('input[type="checkbox"]').forEach((node) => {
+      map[node.dataset.id] = node.checked;
     });
     return map;
   }
@@ -526,9 +594,7 @@
       }
       if (opts.indexedDB) {
         const r = await clearIndexedDB();
-        report.push(
-          r.note ? `IndexedDB: ${r.note}` : `IndexedDB: ${r.deleted}`
-        );
+        report.push(r.note ? `IndexedDB: ${r.note}` : `IndexedDB: ${r.deleted}`);
       }
       if (opts.cacheStorage) {
         const n = await clearCacheStorage();
@@ -672,6 +738,7 @@
   });
 
   function isHotkey(e) {
+    if (e.repeat) return false;
     if (e.altKey !== HOTKEY.alt) return false;
     if (e.shiftKey !== HOTKEY.shift) return false;
     if (e.ctrlKey || e.metaKey) return false;
@@ -681,22 +748,27 @@
     return key === 'k';
   }
 
-  window.addEventListener(
-    'keydown',
-    (e) => {
-      if (isHotkey(e)) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        togglePanel();
-        return;
-      }
-      if ((e.key === 'Escape' || e.code === 'Escape') && panel.classList.contains('open')) {
-        e.preventDefault();
-        closePanel();
-      }
-    },
-    true
-  );
+  let lastHotkeyAt = 0;
+  function onKeyDown(e) {
+    if (isHotkey(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      const now = Date.now();
+      if (now - lastHotkeyAt < 80) return;
+      lastHotkeyAt = now;
+      togglePanel();
+      return;
+    }
+    if ((e.key === 'Escape' || e.code === 'Escape') && panel.classList.contains('open')) {
+      e.preventDefault();
+      closePanel();
+    }
+  }
+
+  // Capture on window first so sites like YouTube (which bind 'k' later) don't eat it.
+  window.addEventListener('keydown', onKeyDown, true);
+  document.addEventListener('keydown', onKeyDown, true);
 
   document.addEventListener(
     'mousedown',
@@ -709,13 +781,31 @@
     true
   );
 
-  // SPA / framework may rebuild <html> children and drop the host.
-  const mo = new MutationObserver(() => {
-    if (!host.isConnected && hostNeeded()) {
-      showHost();
-    }
-  });
-  mo.observe(document.documentElement, { childList: true });
+  // SPA / framework may rebuild <html>/<body> children and drop the host.
+  let remountQueued = false;
+  function watch(target) {
+    if (!target) return;
+    new MutationObserver(() => {
+      if (host.isConnected || !hostNeeded() || remountQueued) return;
+      remountQueued = true;
+      requestAnimationFrame(() => {
+        remountQueued = false;
+        if (!host.isConnected && hostNeeded()) showHost();
+      });
+    }).observe(target, { childList: true });
+  }
+  watch(document.documentElement);
+  if (document.body) watch(document.body);
+  else {
+    document.addEventListener(
+      'DOMContentLoaded',
+      () => {
+        watch(document.body);
+        if (hostNeeded()) showHost();
+      },
+      { once: true }
+    );
+  }
 
   if (typeof GM_registerMenuCommand === 'function') {
     GM_registerMenuCommand('打开清理面板', openPanel);
